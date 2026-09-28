@@ -103,6 +103,16 @@ pub struct Config {
     pub service: Option<String>,
     pub port: Option<u16>,
     pub database: Option<Database>,
+    pub deps: Option<DepsCheck>,
+}
+
+/// Compare the worktree's lockfile with the one baked into the image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepsCheck {
+    /// Relative to the worktree, such as `pnpm-lock.yaml`.
+    pub lockfile: String,
+    /// Inside the image, such as `/app/pnpm-lock.yaml`.
+    pub image_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +130,19 @@ struct Raw {
     #[serde(default)]
     runtime: RawRuntime,
     database: Option<RawDatabase>,
+    #[serde(default)]
+    checks: RawChecks,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawChecks {
+    deps: Option<RawDeps>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDeps {
+    lockfile: String,
+    image_path: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -201,6 +224,10 @@ fn resolve(raw: Raw) -> Result<Config> {
         service: raw.runtime.service,
         port: raw.runtime.port,
         database,
+        deps: raw.checks.deps.map(|deps| DepsCheck {
+            lockfile: deps.lockfile,
+            image_path: deps.image_path,
+        }),
     })
 }
 

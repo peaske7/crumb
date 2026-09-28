@@ -33,6 +33,15 @@ pub fn status(lease: &Lease, now: Timestamp) -> (String, Tone) {
         Some(since) => format!("up {}", age(since, now)),
         None => "up".to_string(),
     };
+    // A running lease that is behind says so instead of how long it has run.
+    if lease.group == Group::Running {
+        if lease.reasons.contains(&Reason::DepsBehind) {
+            return ("deps behind".to_string(), Tone::Warn);
+        }
+        if lease.reasons.contains(&Reason::RestartPending) {
+            return ("restart pending".to_string(), Tone::Warn);
+        }
+    }
     match &lease.state {
         State::Healthy if lease.group == Group::Orphaned => (up(), Tone::Dim),
         State::Healthy => (with_age("healthy".into(), ""), Tone::Normal),
@@ -138,6 +147,27 @@ pub fn reasons(lease: &Lease, now: Timestamp) -> Vec<(&'static str, String, Tone
                     .unwrap_or_default(),
                 Tone::Bad,
             ),
+            Reason::RestartPending => (
+                "build",
+                format!(
+                    "{} changed after the backend started",
+                    lease.changed_file.as_deref().unwrap_or("a file")
+                ),
+                Tone::Warn,
+            ),
+            Reason::DepsBehind => {
+                let built = lease
+                    .image_built
+                    .map(|at| format!(", built {} ago", age(at, now)))
+                    .unwrap_or_default();
+                (
+                    "deps",
+                    format!(
+                        "the lockfile differs from the image's{built}; the next start may fail"
+                    ),
+                    Tone::Warn,
+                )
+            }
         })
         .collect()
 }

@@ -3,13 +3,14 @@ use std::path::Path;
 use anyhow::Result;
 use jiff::Timestamp;
 
+use crate::checks::{self, Images};
 use crate::config::Config;
 use crate::lease::{self, Lease};
-use crate::mutagen;
-use crate::probe::{self, Mem};
+use crate::mutagen::{self, SyncSession};
+use crate::probe::{self, HostFacts, Mem};
 use crate::run::Runner;
 
-/// Everything one refresh learned.
+/// Everything one refresh learned, joined into lease rows.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub at: Timestamp,
@@ -19,8 +20,16 @@ pub struct Snapshot {
     pub warnings: Vec<String>,
 }
 
-/// Reads the host and Mutagen in parallel and joins them.
-pub fn collect(config: &Config, runner: &Runner) -> Result<Snapshot> {
+/// What the host and Mutagen reported, before joining.
+pub struct Facts {
+    at: Timestamp,
+    host: HostFacts,
+    syncs: Vec<SyncSession>,
+    warnings: Vec<String>,
+}
+
+/// Reads the host and Mutagen in parallel.
+pub fn gather(config: &Config, runner: &Runner) -> Result<Facts> {
     let (host, syncs) = std::thread::scope(|scope| {
         let syncs = config
             .mutagen
@@ -39,12 +48,41 @@ pub fn collect(config: &Config, runner: &Runner) -> Result<Snapshot> {
             Vec::new()
         }
     };
-    let leases = lease::join(config, &host, &syncs, |path| Path::new(path).exists());
-    Ok(Snapshot {
+    Ok(Facts {
         at: Timestamp::now(),
-        host: config.host.label().to_string(),
-        mem: host.mem,
-        leases,
+        host,
+        syncs,
         warnings,
     })
+}
+
+/// Joins the facts into leases and runs the local checks. Cheap enough to run
+/// again once more image facts arrive.
+pub fn assemble(config: &Config, facts: &Facts, images: &Images) -> Snapshot {
+    let mut leases = lease::join(config, &facts.host, &facts.syncs, |path| {
+        Path::new(path).exists()
+    });
+    checks::apply(config, images, &mut leases);
+    Snapshot {
+        at: facts.at,
+        host: config.host.label().to_string(),
+        mem: facts.host.mem,
+        leases,
+        warnings: facts.warnings.clone(),
+    }
+}
+
+/// A complete snapshot in one call, for `crumb ls`: waits for image facts.
+pub fn collect(config: &Config, runner: &Runner) -> Result<Snapshot> {
+    let facts = gather(config, runner)?;
+    let mut images = Images::default();
+    let snapshot = assemble(config, &facts, &images);
+    let missing = images.missing(config, &snapshot.leases);
+    if missing.is_empty() {
+        return Ok(snapshot);
+    }
+    for id in &missing {
+        images.fetch(runner, config, id);
+    }
+    Ok(assemble(config, &facts, &images))
 }

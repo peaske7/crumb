@@ -53,6 +53,18 @@ pub enum Reason {
     SyncConflicts,
     SyncError,
     SyncDisconnected,
+    /// Files in the worktree changed after the backend started.
+    RestartPending,
+    /// The worktree's lockfile differs from the one in the image.
+    DepsBehind,
+}
+
+impl Reason {
+    /// Soft reasons mean "behind", not "broken": the lease stays in its group
+    /// and says so in its status.
+    pub fn is_soft(&self) -> bool {
+        matches!(self, Reason::RestartPending | Reason::DepsBehind)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +76,14 @@ pub struct Lease {
     pub worktree: Option<Worktree>,
     /// The main container's name, for logs.
     pub container: Option<String>,
+    /// The main container's image id.
+    pub image: Option<String>,
+    /// Worktree paths the backend bind-mounts, so edits there reach it.
+    pub watch: Vec<String>,
+    /// The first file that changed after the backend started, relative to the worktree.
+    pub changed_file: Option<String>,
+    /// When the image the backend runs was built, once it is known.
+    pub image_built: Option<Timestamp>,
     pub port: Option<u16>,
     pub memory_bytes: Option<u64>,
     pub restarts: u64,
@@ -71,6 +91,25 @@ pub struct Lease {
     pub since: Option<Timestamp>,
     pub sync: Option<Sync>,
     pub database: Option<Database>,
+}
+
+impl Lease {
+    pub fn worktree_gone(&self) -> bool {
+        self.worktree.as_ref().is_some_and(|w| !w.exists)
+    }
+
+    /// Places the lease by what to do about it. Call again after adding reasons.
+    pub fn regroup(&mut self) {
+        self.group = if self.worktree_gone() {
+            Group::Orphaned
+        } else if self.state == State::Absent && self.sync.is_none() {
+            Group::DatabaseOnly
+        } else if self.reasons.iter().any(|r| !r.is_soft()) {
+            Group::NeedsYou
+        } else {
+            Group::Running
+        };
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -189,20 +228,15 @@ fn build(
 
     let gone = worktree.as_ref().is_some_and(|w| !w.exists);
     let reasons = reasons(&state, gone, sync.as_ref());
-    let group = if gone {
-        Group::Orphaned
-    } else if state == State::Absent && sync.is_none() {
-        Group::DatabaseOnly
-    } else if reasons.is_empty() {
-        Group::Running
-    } else {
-        Group::NeedsYou
-    };
 
-    Lease {
+    let mut lease = Lease {
         name,
-        group,
+        group: Group::Running,
         container: main.map(|c| c.name.trim_start_matches('/').to_string()),
+        image: main.and_then(|c| c.image.clone()),
+        watch: main.map(watched_paths).unwrap_or_default(),
+        changed_file: None,
+        image_built: None,
         port: main.and_then(|c| published_port(config, c)),
         memory_bytes: (!memory.is_empty()).then(|| memory.iter().sum()),
         restarts: main.map_or(0, |c| c.restarts),
@@ -212,7 +246,31 @@ fn build(
         worktree,
         sync,
         database,
-    }
+    };
+    lease.regroup();
+    lease
+}
+
+/// The main container's bind mounts that come from its project directory,
+/// relative to it: `apps/backend/src`, `packages`. These are the worktree
+/// paths whose edits the backend sees.
+fn watched_paths(c: &Container) -> Vec<String> {
+    let Some(root) = c.label("com.docker.compose.project.working_dir") else {
+        return Vec::new();
+    };
+    let root = format!("{}/", root.trim_end_matches('/'));
+    let mut paths: Vec<String> = c
+        .mounts
+        .iter()
+        .flatten()
+        .filter(|m| m.kind == "bind")
+        .filter_map(|m| m.source.strip_prefix(&root))
+        .filter(|relative| !relative.is_empty())
+        .map(str::to_string)
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn reasons(state: &State, worktree_gone: bool, sync: Option<&Sync>) -> Vec<Reason> {
@@ -349,6 +407,7 @@ mod tests {
                 server: DbServer::Docker("db".into()),
                 user: "postgres".into(),
             }),
+            deps: None,
         }
     }
 
@@ -474,6 +533,26 @@ mod tests {
                 .all(|pair| { (pair[0].group, &pair[0].name) <= (pair[1].group, &pair[1].name) })
         );
         assert_eq!(leases.last().unwrap().group, Group::DatabaseOnly);
+    }
+
+    #[test]
+    fn watches_only_bind_mounts_from_the_project_directory() {
+        let (mut host, syncs) = facts();
+        let mount = |kind: &str, source: &str| crate::probe::Mount {
+            kind: kind.into(),
+            source: source.into(),
+        };
+        container(&mut host, "/wt_lym_1119-backend-1").mounts = Some(vec![
+            mount("bind", "/home/dev/app/certs"),
+            mount("bind", "/home/dev/wt/lym_1119/packages"),
+            mount("bind", "/home/dev/wt/lym_1119/apps/backend/src"),
+            mount("volume", "/var/lib/docker/volumes/x/_data"),
+        ]);
+        let leases = join(&config(), &host, &syncs, present);
+        assert_eq!(
+            find(&leases, "lym_1119").watch,
+            ["apps/backend/src", "packages"]
+        );
     }
 
     #[test]
