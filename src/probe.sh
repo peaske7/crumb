@@ -16,7 +16,7 @@ containers() {
   echo "@@containers"
   if [ -n "$ids" ]; then
     # shellcheck disable=SC2086
-    docker inspect --format '{"id":{{json .Id}},"name":{{json .Name}},"status":{{json .State.Status}},"exit_code":{{.State.ExitCode}},"started_at":{{json .State.StartedAt}},"finished_at":{{json .State.FinishedAt}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},"restarts":{{.RestartCount}},"labels":{{json .Config.Labels}},"image":{{json .Image}},"ports":{{json .NetworkSettings.Ports}},"bindings":{{json .HostConfig.PortBindings}}}' $ids
+    docker inspect --format '{"id":{{json .Id}},"name":{{json .Name}},"status":{{json .State.Status}},"exit_code":{{.State.ExitCode}},"started_at":{{json .State.StartedAt}},"finished_at":{{json .State.FinishedAt}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},"restarts":{{.RestartCount}},"labels":{{json .Config.Labels}},"image":{{json .Image}},"mounts":{{json .Mounts}},"ports":{{json .NetworkSettings.Ports}},"bindings":{{json .HostConfig.PortBindings}}}' $ids
   fi
   echo "@@memory"
   for id in $ids; do

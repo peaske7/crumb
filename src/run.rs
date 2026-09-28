@@ -158,6 +158,11 @@ impl Runner {
     }
 }
 
+/// Single-quotes a value for a POSIX shell.
+pub fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// A running command started by [`Runner::stream`].
 pub struct Stream {
     child: Child,
@@ -264,6 +269,11 @@ fn spawn(program: &str, args: &[String], stdin: Option<&[u8]>) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quotes_values_for_the_shell() {
+        assert_eq!(quote("it's"), "'it'\\''s'");
+    }
 
     #[test]
     fn durations_read_at_a_glance() {

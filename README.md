@@ -73,6 +73,10 @@ port = 8080
 [database]
 name = "wt_{lease}"
 server = "docker://postgres"
+
+[checks]
+# Say "deps behind" when the worktree's lockfile differs from the image's.
+deps = { lockfile = "pnpm-lock.yaml", image_path = "/app/pnpm-lock.yaml" }
 ```
 
 More configurations, including local Docker and dev servers without Docker,

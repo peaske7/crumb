@@ -167,6 +167,9 @@ port.
   stay stopped after a host reboot instead of all starting at once.
 - Dependency drift: the SHA-256 of the lockfile inside the image (computed
   once per image id) against the worktree's lockfile.
+- Restart pending: a file changed after the container started, under the
+  paths it bind-mounts from its project directory. Only those paths reach
+  the running backend, so other edits in the worktree don't count.
 
 ## The probe
 
@@ -232,7 +235,9 @@ shape.
 - Groups in the order you act on them: needs you, running, orphaned,
   databases only. With one group there is no heading.
 - One status phrase per lease instead of per-layer columns; a layer speaks up
-  only when it is behind.
+  only when it is behind. Behind (restart pending, deps behind) is yellow and
+  keeps the lease in its group; broken (crash loop, exited, sync failing)
+  moves it to "needs you".
 - The selected row expands in place with the reason and the key that fixes
   it. Logs and the command log are full-screen views left with `esc`.
 - Reap and drop show their plan in place of the list; one key applies it.

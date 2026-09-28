@@ -21,6 +21,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::checks::Images;
 use crate::config::{Config, Host};
 use crate::lease::Lease;
 use crate::run::Runner;
@@ -55,12 +56,30 @@ pub fn run(config: Config) -> Result<()> {
     result
 }
 
-/// Reads on its own thread so the screen never waits on the network.
+/// Reads on its own thread so the screen never waits on the network. A new
+/// image's facts take about a second, so the list is sent first and sent
+/// again once they arrive.
 fn spawn_refresh(config: Config, runner: Runner, tx: Sender<Msg>) {
     thread::spawn(move || {
+        let mut images = Images::default();
+        let send = |result: Result<Snapshot>| tx.send(Msg::Snapshot(Box::new(result))).is_ok();
         loop {
-            let result = snapshot::collect(&config, &runner);
-            if tx.send(Msg::Snapshot(Box::new(result))).is_err() {
+            let open = match snapshot::gather(&config, &runner) {
+                Err(err) => send(Err(err)),
+                Ok(facts) => {
+                    let first = snapshot::assemble(&config, &facts, &images);
+                    let missing = images.missing(&config, &first.leases);
+                    let mut open = send(Ok(first));
+                    if open && !missing.is_empty() {
+                        for id in &missing {
+                            images.fetch(&runner, &config, id);
+                        }
+                        open = send(Ok(snapshot::assemble(&config, &facts, &images)));
+                    }
+                    open
+                }
+            };
+            if !open {
                 break;
             }
             thread::sleep(REFRESH);

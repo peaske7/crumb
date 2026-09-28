@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::config::{Config, DbServer};
-use crate::run::Runner;
+use crate::run::{Runner, quote};
 
 const SCRIPT: &str = include_str!("probe.sh");
 
@@ -44,6 +44,10 @@ pub struct Container {
     #[serde(default)]
     pub labels: Option<HashMap<String, String>>,
     #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub mounts: Option<Vec<Mount>>,
+    #[serde(default)]
     pub ports: Option<HashMap<String, Option<Vec<Binding>>>>,
     #[serde(default)]
     pub bindings: Option<HashMap<String, Option<Vec<Binding>>>>,
@@ -53,6 +57,15 @@ impl Container {
     pub fn label(&self, key: &str) -> Option<&str> {
         self.labels.as_ref()?.get(key).map(String::as_str)
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Mount {
+    #[serde(rename = "Type")]
+    pub kind: String,
+    #[serde(default)]
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -103,11 +116,6 @@ fn script(config: &Config) -> String {
         quote(user),
         quote(&like),
     )
-}
-
-/// Single-quotes a value for bash.
-fn quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 pub fn parse(output: &str) -> Result<HostFacts> {
@@ -214,10 +222,5 @@ mod tests {
         let truncated = SAMPLE.split("@@databases").next().unwrap();
         assert!(parse(truncated).is_err());
         assert!(parse("").is_err());
-    }
-
-    #[test]
-    fn quotes_values_for_bash() {
-        assert_eq!(quote("it's"), "'it'\\''s'");
     }
 }
