@@ -243,7 +243,7 @@ fn run(cli: Cli, runner: &Runner) -> Result<()> {
             if !confirmed {
                 bail!("not confirmed; nothing changed");
             }
-            ops::drop(&ctx, &name)
+            ops::drop(&ctx, &name, checkout.as_ref().map(|c| c.root.as_path()))
         }
         Command::Migrate { name } => ops::migrate(&ctx, &name_or_here(&ctx, name, &checkout)?),
         Command::Tunnel { name } => ops::tunnel(&ctx, &name_or_here(&ctx, name, &checkout)?),
@@ -412,14 +412,8 @@ fn reap(ctx: &Ctx, yes: bool, dry_run: bool) -> Result<()> {
 fn logs(ctx: &Ctx, name: &str, follow: bool, tail: usize) -> Result<()> {
     let (_, lease) = ctx.lease(name)?;
     let lease = lease.with_context(|| format!("no lease named {name}"))?;
-    let container = lease
-        .container
-        .with_context(|| format!("{name} has no containers"))?;
-    let follow = if follow { " --follow" } else { "" };
-    let command = format!(
-        "docker logs{follow} --tail {tail} {} 2>&1",
-        run::quote(&container)
-    );
+    let command = ops::log_command(ctx.config, &lease, follow, tail)
+        .with_context(|| format!("{name} has no backend to read a log from"))?;
     let status = ctx.runner.attach(&ctx.config.host, &command)?;
     if !status.success() {
         bail!("docker logs exited with {status}");

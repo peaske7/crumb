@@ -138,10 +138,11 @@ enum View {
     Confirm(Pending),
 }
 
-/// Error lines under a failed lease are fetched once per container run.
+/// Error lines under a failed lease are fetched once per run of its backend.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ExcerptKey {
-    container: String,
+    /// The command that prints the log.
+    source: String,
     since: Option<Timestamp>,
 }
 
@@ -320,7 +321,7 @@ impl App {
     fn verbs(&self, lease: &Lease) -> Vec<(&'static str, &'static str)> {
         let mut keys = Vec::new();
         let live = lease.live_worktree().is_some();
-        let has_backend = lease.container.is_some() || lease.sync.is_some();
+        let has_backend = lease.state != crate::lease::State::Absent || lease.sync.is_some();
         if lease.group == Group::Orphaned {
             keys.push(("R", "reap"));
             if has_backend {
@@ -449,7 +450,7 @@ impl App {
             }
             Pending::Drop { lease, .. } => {
                 let name = lease.clone();
-                self.spawn("drop", lease, move |ctx| ops::drop(ctx, &name));
+                self.spawn("drop", lease, move |ctx| ops::drop(ctx, &name, None));
             }
             Pending::Reap { plan } => {
                 for item in &plan.items {
@@ -519,20 +520,16 @@ impl App {
         let Some(lease) = self.selected_lease() else {
             return;
         };
-        let Some(container) = lease.container.clone().filter(|c| safe_name(c)) else {
+        let Some(command) = ops::log_command(&self.config, lease, true, 300) else {
             return;
         };
         let name = lease.name.clone();
         self.generation += 1;
         let generation = self.generation;
         let tx = self.tx.clone();
-        let stream = self.runner.stream(
-            &self.host,
-            &format!("docker logs --follow --tail 300 {container} 2>&1"),
-            move |line| {
-                let _ = tx.send(Msg::LogLine { generation, line });
-            },
-        );
+        let stream = self.runner.stream(&self.host, &command, move |line| {
+            let _ = tx.send(Msg::LogLine { generation, line });
+        });
         self.view = View::Logs(logs::Logs::new(name, stream));
     }
 
@@ -548,11 +545,11 @@ impl App {
         if !self.list.expanded(lease) || !failed(lease) {
             return;
         }
-        let Some(container) = lease.container.clone().filter(|c| safe_name(c)) else {
+        let Some(command) = ops::log_command(&self.config, lease, false, 300) else {
             return;
         };
         let key = ExcerptKey {
-            container: container.clone(),
+            source: command.clone(),
             since: lease.since,
         };
         if self.excerpts.contains_key(&key) {
@@ -562,7 +559,7 @@ impl App {
         let (runner, host, tx) = (self.runner.clone(), self.host.clone(), self.tx.clone());
         thread::spawn(move || {
             let result = runner
-                .command(&host, &format!("docker logs --tail 300 {container} 2>&1"))
+                .command(&host, &command)
                 .map_err(|err| format!("{err:#}"))
                 .and_then(|output| {
                     let text = String::from_utf8_lossy(&output.stdout);
@@ -578,7 +575,7 @@ impl App {
 
     fn excerpt_for(&self, lease: &Lease) -> Option<&Excerpt> {
         self.excerpts.get(&ExcerptKey {
-            container: lease.container.clone()?,
+            source: ops::log_command(&self.config, lease, false, 300)?,
             since: lease.since,
         })
     }
@@ -654,14 +651,6 @@ fn failed(lease: &Lease) -> bool {
         lease.state,
         State::CrashLoop { .. } | State::Exited { .. } | State::Unhealthy
     )
-}
-
-/// Container names go into a shell command, so only plain names are used.
-fn safe_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
 /// Hands text to the terminal's clipboard with OSC 52, which works over SSH
@@ -741,12 +730,5 @@ mod tests {
         assert_eq!(base64(b"ab"), "YWI=");
         assert_eq!(base64(b"crumb"), "Y3J1bWI=");
         assert_eq!(base64(b"ssh indigo"), "c3NoIGluZGlnbw==");
-    }
-
-    #[test]
-    fn only_plain_container_names_reach_the_shell() {
-        assert!(safe_name("wt_lym_1119-backend-1"));
-        assert!(!safe_name("x; rm -rf /"));
-        assert!(!safe_name(""));
     }
 }

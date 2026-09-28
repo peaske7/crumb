@@ -114,7 +114,7 @@ if [ "$RUNTIME" = compose ]; then
   docker compose "$@" up -d $UP_ARGS >&2
 else
   if tmux has-session -t "=$PROJECT" 2>/dev/null; then
-    if [ "$(tmux display-message -p -t "=$PROJECT" '#{pane_dead}')" = 1 ]; then
+    if [ "$(tmux display-message -p -t "=$PROJECT:" '#{pane_dead}')" = 1 ]; then
       tmux kill-session -t "=$PROJECT"
     else
       echo "already running in tmux session $PROJECT" >&2
@@ -126,7 +126,7 @@ else
   : >"$log"
   tmux new-session -d -s "$PROJECT" -c "$PROJECT_DIR" \
     -e "CRUMB_LEASE=$LEASE" -e "CRUMB_PORT=$port" -e "CRUMB_DATABASE=${DATABASE:-}" -e "CRUMB_WORKTREE=$WORKTREE" \
-    "$START" \; set-option -t "=$PROJECT" remain-on-exit on \; pipe-pane -t "=$PROJECT" -o "cat >>'$log'"
+    "$START" \; set-option -w -t "=$PROJECT:" remain-on-exit on \; pipe-pane -t "=$PROJECT:" -o "cat >>'$log'"
   tmux set-environment -t "=$PROJECT" CRUMB_PORT "$port"
   echo "started tmux session $PROJECT" >&2
 fi

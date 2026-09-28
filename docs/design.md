@@ -181,6 +181,26 @@ port.
   paths it bind-mounts from its project directory. Only those paths reach
   the running backend, so other edits in the worktree don't count.
 
+## Runtime (a process in tmux)
+
+- `runtime.start` runs in a tmux session named after the project
+  (`app_{lease}`), in the worktree (or its replica), with `CRUMB_PORT`,
+  `CRUMB_LEASE`, `CRUMB_DATABASE` and `CRUMB_WORKTREE` set and kept in the
+  session, so the session itself says which port the lease has.
+- The pane stays after the command exits, so its exit status reads as
+  "exited 1" or "stopped". Output goes to `<lease>/output.log` in crumb's
+  state directory for logs and error lines.
+- `runtime.ready` is a URL; answering is healthy. Without one, a live pane
+  counts as running.
+
+## A local host
+
+- `host = "local"`: no sync, compose runs in the worktree itself, ports are
+  direct (`local_base` is `host_base`), and state lives in
+  `~/.local/state/crumb`.
+- Where there is no `flock` (macOS), the host lock is a directory made with
+  `mkdir`.
+
 ## The probe
 
 One bash script, compiled into crumb and sent to the host on stdin

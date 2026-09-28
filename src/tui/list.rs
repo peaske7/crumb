@@ -304,7 +304,7 @@ pub(super) fn keys(app: &App) -> Line<'static> {
     {
         pairs.extend(app.verbs(lease));
     }
-    if lease.is_some_and(|l| l.container.is_some()) {
+    if lease.is_some_and(|l| crate::ops::log_command(&app.config, l, false, 1).is_some()) {
         pairs.push(("l", "logs"));
     }
     pairs.extend([("c", "commands"), ("q", "quit")]);

@@ -383,6 +383,92 @@ fn log_excerpt(ctx: &Ctx, container: &str) -> Option<String> {
     })
 }
 
+/// Waits for the backend: Docker's health check for compose, the ready URL
+/// for a process.
+pub(super) fn wait_ready(ctx: &Ctx, lease: &str, vars: &Vars) -> Result<()> {
+    let project = ctx.config.project.render(lease);
+    match &ctx.config.runtime {
+        Runtime::Compose { .. } => {
+            let service = ctx.config.service.as_deref().unwrap_or_default();
+            ctx.out
+                .step("Waiting", &format!("for {service} to be healthy"));
+            let took = wait_healthy(ctx, &project, service)?;
+            ctx.out.step(
+                "Healthy",
+                &format!("{service} in {}", crate::run::duration(took)),
+            );
+        }
+        Runtime::Process { ready, .. } => {
+            let Some(ready) = ready else {
+                return Ok(());
+            };
+            let url = vars.render(ready);
+            ctx.out.step("Waiting", &format!("for {url}"));
+            let started = Instant::now();
+            loop {
+                let check = format!(
+                    "curl -fsS -m 2 -o /dev/null {} || {{ tmux display-message -p -t {} '#{{pane_dead}}' | grep -qx 1 && echo dead; exit 1; }}",
+                    quote(&url),
+                    quote(&format!("={project}:")),
+                );
+                let output = ctx.runner.command(&ctx.config.host, &check)?;
+                if output.status.success() {
+                    ctx.out.step(
+                        "Answered",
+                        &format!("in {}", crate::run::duration(started.elapsed())),
+                    );
+                    return Ok(());
+                }
+                if String::from_utf8_lossy(&output.stdout).contains("dead") {
+                    let log = format!(
+                        "{}/{}/output.log",
+                        shell_path(&state_root(ctx.config)),
+                        quote(lease)
+                    );
+                    let tail = ctx
+                        .runner
+                        .command(&ctx.config.host, &format!("tail -n 20 {log}"))
+                        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                        .unwrap_or_default();
+                    bail!("{project} exited before it was ready\n{tail}");
+                }
+                if started.elapsed() > Duration::from_secs(600) {
+                    bail!("{url} did not answer in 10 minutes");
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The shell command that prints a lease's log: `docker logs` for compose,
+/// the session's output file for a process.
+pub fn log_command(config: &Config, lease: &Lease, follow: bool, tail: usize) -> Option<String> {
+    match &config.runtime {
+        Runtime::Compose { .. } => {
+            let container = lease.container.as_deref()?;
+            let follow = if follow { " --follow" } else { "" };
+            Some(format!(
+                "docker logs{follow} --tail {tail} {} 2>&1",
+                quote(container)
+            ))
+        }
+        Runtime::Process { .. } => {
+            if lease.state == crate::lease::State::Absent {
+                return None;
+            }
+            let file = format!(
+                "{}/{}/output.log",
+                shell_path(&state_root(config)),
+                quote(&lease.name)
+            );
+            let follow = if follow { " -F" } else { "" };
+            Some(format!("tail -n {tail}{follow} {file}"))
+        }
+    }
+}
+
 /// Runs a configured command on this machine per the command contract:
 /// `CRUMB_*` variables in, progress on stderr, optionally one JSON object on
 /// stdout whose fields come back as `{prefix.field}` variables.
@@ -486,13 +572,6 @@ fn sql_literal(value: &str) -> String {
 /// A SQL identifier.
 fn sql_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
-}
-
-fn compose_only(config: &Config) -> Result<()> {
-    match config.runtime {
-        Runtime::Compose { .. } => Ok(()),
-        Runtime::Process { .. } => bail!("this needs the compose runtime"),
-    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::config::{Config, Forward, Host};
 use crate::mutagen::{ForwardSession, SyncSession};
-use crate::probe::{Binding, Container, DatabaseFact, HostFacts};
+use crate::probe::{Binding, Container, DatabaseFact, HostFacts, Session};
 use crate::template::Vars;
 use crate::wire;
 
@@ -255,6 +255,7 @@ struct Parts<'a> {
     containers: Vec<&'a Container>,
     sync: Option<&'a SyncSession>,
     forward: Option<&'a ForwardSession>,
+    session: Option<&'a Session>,
     database: Option<&'a DatabaseFact>,
 }
 
@@ -290,6 +291,11 @@ pub fn join(
             parts.entry(lease.to_string()).or_default().forward = Some(session);
         }
     }
+    for session in &host.sessions {
+        if let Some(lease) = config.project.lease_of(&session.name) {
+            parts.entry(lease.to_string()).or_default().session = Some(session);
+        }
+    }
     if let Some(db) = &config.database {
         for fact in &host.databases {
             if let Some(lease) = db.name.lease_of(&fact.name) {
@@ -316,10 +322,15 @@ fn build(
 ) -> Lease {
     parts.containers.sort_by(|a, b| a.name.cmp(&b.name));
     let main = main_container(config, &parts.containers);
-    let state = state_of(main);
+    let session = parts.session.filter(|_| main.is_none());
+    let state = match session {
+        Some(session) => session_state(session),
+        None => state_of(main),
+    };
 
     let path = main
         .and_then(|c| c.label("crumb.worktree"))
+        .or_else(|| session.and_then(|s| s.worktree.as_deref()))
         .or_else(|| parts.sync.and_then(SyncSession::local_alpha))
         .or_else(|| match config.host {
             Host::Local => main.and_then(|c| c.label("com.docker.compose.project.working_dir")),
@@ -357,7 +368,9 @@ fn build(
         paused: f.paused,
         error: f.last_error.clone().filter(|e| !e.is_empty()),
     });
-    let port = main.and_then(|c| published_port(config, c));
+    let port = main
+        .and_then(|c| published_port(config, c))
+        .or_else(|| session.and_then(|s| s.port));
     let local_port = match config.forward {
         Forward::Direct => port,
         Forward::Mutagen => forward.as_ref().and_then(|f| f.local_port),
@@ -389,7 +402,9 @@ fn build(
         local_port,
         memory_bytes: (!memory.is_empty()).then(|| memory.iter().sum()),
         restarts: main.map_or(0, |c| c.restarts),
-        since: main.and_then(since),
+        since: main
+            .and_then(since)
+            .or_else(|| session.and_then(|s| Timestamp::from_second(s.created).ok())),
         state,
         reasons,
         worktree,
@@ -476,6 +491,20 @@ fn main_container<'a>(config: &Config, containers: &[&'a Container]) -> Option<&
         })
         .or_else(|| containers.first())
         .copied()
+}
+
+/// A process lease's state: the ready URL decides health; a dead pane
+/// reports how the command exited.
+fn session_state(session: &Session) -> State {
+    match (session.dead, session.ready) {
+        (true, _) if session.exit_status == 0 => State::Stopped,
+        (true, _) => State::Exited {
+            code: session.exit_status,
+        },
+        (false, Some(true)) => State::Healthy,
+        (false, Some(false)) => State::Starting,
+        (false, None) => State::Running,
+    }
 }
 
 fn state_of(container: Option<&Container>) -> State {
@@ -687,6 +716,51 @@ mod tests {
         container(&mut host, "/wt_lym_1119-backend-1").oom_killed = true;
         let leases = join(&config(), &host, &syncs, &[], present);
         assert_eq!(find(&leases, "lym_1119").state, State::Exited { code: 137 });
+    }
+
+    #[test]
+    fn process_leases_come_from_tmux_sessions() {
+        let config = Config::parse(
+            "[runtime]\nproject = \"app_{lease}\"\nstart = \"x\"\nready = \"http://127.0.0.1:{port}/\"",
+        )
+        .unwrap();
+        let session = |name: &str, dead: bool, status: i64, ready: Option<bool>| Session {
+            name: name.into(),
+            created: 1_790_000_000,
+            dead,
+            exit_status: status,
+            port: Some(4101),
+            ready,
+            worktree: Some(format!("/work/{name}")),
+        };
+        let host = HostFacts {
+            sessions: vec![
+                session("app_a", false, 0, Some(true)),
+                session("app_b", false, 0, Some(false)),
+                session("app_c", true, 1, None),
+                session("other", false, 0, None),
+            ],
+            ..HostFacts::default()
+        };
+        let leases = join(&config, &host, &[], &[], |_| true);
+        let states: Vec<(&str, &State)> =
+            leases.iter().map(|l| (l.name.as_str(), &l.state)).collect();
+        assert_eq!(
+            states,
+            [
+                ("c", &State::Exited { code: 1 }),
+                ("a", &State::Healthy),
+                ("b", &State::Starting),
+            ]
+        );
+        assert_eq!(find(&leases, "a").port, Some(4101));
+        assert_eq!(find(&leases, "a").local_port, Some(4101));
+        assert!(
+            find(&leases, "a")
+                .worktree
+                .as_ref()
+                .is_some_and(|w| w.path == "/work/app_a")
+        );
     }
 
     #[test]

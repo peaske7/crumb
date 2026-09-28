@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 
 use super::{
     Ctx, ensure_forward, psql, replica, run_command, shell_path, sql_ident, state_root, unwire,
-    wait_healthy, wait_sync, wire_all,
+    wait_healthy, wait_ready, wait_sync, wire_all,
 };
 use crate::config::{Forward, Host, Runtime};
 use crate::lease::Lease;
@@ -42,10 +42,11 @@ pub fn restart(ctx: &Ctx, name: &str) -> Result<()> {
         Runtime::Process { .. } => {
             ctx.host_command(&format!(
                 "tmux respawn-pane -k -t {}",
-                quote(&format!("={project}"))
+                quote(&format!("={project}:"))
             ))?;
             ctx.out
                 .step("Restarted", &format!("tmux session {project}"));
+            wait_ready(ctx, name, &lease.vars(ctx.config))?;
         }
     }
     Ok(())
@@ -67,9 +68,11 @@ pub(super) fn stop_lease(ctx: &Ctx, lease: &Lease) -> Result<()> {
             }
         }
         Runtime::Process { .. } => {
+            // Signal the command's process group and keep the dead pane, so
+            // the lease reads "stopped" and `up` reuses its port.
             ctx.host_command(&format!(
-                "tmux kill-session -t {} 2>/dev/null || true",
-                quote(&format!("={project}"))
+                "pid=$(tmux display-message -p -t {} '#{{pane_pid}}' 2>/dev/null) && [ -n \"$pid\" ] && kill -TERM -- -\"$pid\" 2>/dev/null || true",
+                quote(&format!("={project}:"))
             ))?;
             ctx.out.step("Stopped", &format!("tmux session {project}"));
         }
@@ -95,7 +98,14 @@ pub(super) fn stop_lease(ctx: &Ctx, lease: &Lease) -> Result<()> {
 /// Removes containers, forward, sync, replica and wiring. Keeps the database.
 pub fn down(ctx: &Ctx, name: &str) -> Result<()> {
     let (_, lease) = ctx.require(name)?;
-    down_lease(ctx, &lease)
+    down_lease(ctx, &lease)?;
+    if let Some(db) = &lease.database {
+        ctx.out.step(
+            "Kept",
+            &format!("database {} (crumb drop removes it)", db.name),
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn down_lease(ctx: &Ctx, lease: &Lease) -> Result<()> {
@@ -113,10 +123,14 @@ pub(super) fn down_lease(ctx: &Ctx, lease: &Lease) -> Result<()> {
             }
         }
         Runtime::Process { .. } => {
-            ctx.host_command(&format!(
-                "tmux kill-session -t {} 2>/dev/null || true",
-                quote(&format!("={project}"))
-            ))?;
+            if lease.state != crate::lease::State::Absent {
+                ctx.host_command(&format!(
+                    "pid=$(tmux display-message -p -t {p} '#{{pane_pid}}' 2>/dev/null); [ -z \"$pid\" ] || kill -TERM -- -\"$pid\" 2>/dev/null; tmux kill-session -t {s} 2>/dev/null || true",
+                    p = quote(&format!("={project}:")),
+                    s = quote(&format!("={project}")),
+                ))?;
+                ctx.out.step("Removed", &format!("tmux session {project}"));
+            }
         }
     }
     if let Some(forward) = &lease.forward {
@@ -161,19 +175,33 @@ pub(super) fn down_lease(ctx: &Ctx, lease: &Lease) -> Result<()> {
     if let Some(worktree) = lease.live_worktree() {
         unwire(ctx, Path::new(worktree))?;
     }
-    if let Some(db) = &lease.database {
-        ctx.out.step(
-            "Kept",
-            &format!("database {} (crumb drop removes it)", db.name),
-        );
-    }
     Ok(())
 }
 
 /// `down`, then drops the database. The caller confirms first.
-pub fn drop(ctx: &Ctx, name: &str) -> Result<()> {
-    let (_, lease) = ctx.require(name)?;
-    down_lease(ctx, &lease)?;
+/// `worktree` is where a drop command runs when the lease has none left.
+pub fn drop(ctx: &Ctx, name: &str, worktree: Option<&Path>) -> Result<()> {
+    // A database only a command knows about has no row once the rest is down.
+    let lease = match ctx.lease(name)?.1 {
+        Some(lease) => {
+            down_lease(ctx, &lease)?;
+            lease
+        }
+        None if ctx
+            .config
+            .database
+            .as_ref()
+            .is_some_and(|db| db.drop.is_some()) =>
+        {
+            let mut lease = Lease::new(name);
+            lease.worktree = worktree.map(|w| crate::lease::Worktree {
+                path: w.to_string_lossy().into_owned(),
+                exists: true,
+            });
+            lease
+        }
+        None => bail!("no lease named {name} on {}", ctx.config.host.label()),
+    };
     let Some(db) = &ctx.config.database else {
         return Ok(());
     };
