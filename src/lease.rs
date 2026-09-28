@@ -62,6 +62,8 @@ pub struct Lease {
     pub state: State,
     pub reasons: Vec<Reason>,
     pub worktree: Option<Worktree>,
+    /// The main container's name, for logs.
+    pub container: Option<String>,
     pub port: Option<u16>,
     pub memory_bytes: Option<u64>,
     pub restarts: u64,
@@ -200,6 +202,7 @@ fn build(
     Lease {
         name,
         group,
+        container: main.map(|c| c.name.trim_start_matches('/').to_string()),
         port: main.and_then(|c| published_port(config, c)),
         memory_bytes: (!memory.is_empty()).then(|| memory.iter().sum()),
         restarts: main.map_or(0, |c| c.restarts),
