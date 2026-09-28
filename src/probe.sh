@@ -1,7 +1,7 @@
 # crumb probe: prints the host-side facts crumb needs in one pass.
 # Sent on stdin (`bash -s`), so nothing is installed on the host. crumb
-# prepends PROJECT_PREFIX, DB_DOCKER, DB_URL, DB_USER, DB_LIKE and SCHEMA_QUERY
-# assignments.
+# prepends PROJECT_PREFIX, DB_DOCKER, DB_URL, DB_USER, DB_LIKE, SCHEMA_QUERY,
+# RUNTIME and READY assignments.
 #
 # Never print container environment variables: they hold secrets.
 #
@@ -63,6 +63,26 @@ databases() {
   fi
 }
 
+# Process leases: tmux sessions named after the project, with the port and
+# worktree `crumb up` stored in the session and the ready URL's answer.
+sessions() {
+  echo "@@tmux"
+  command -v tmux >/dev/null 2>&1 || return 0
+  tmux list-panes -a -F '#{session_name} #{session_created} #{pane_dead} #{pane_dead_status}' 2>/dev/null |
+    while read -r name created dead status; do
+      case "$name" in "$PROJECT_PREFIX"*) ;; *) continue ;; esac
+      env=$(tmux show-environment -t "=$name" 2>/dev/null)
+      port=$(printf '%s\n' "$env" | sed -n 's/^CRUMB_PORT=//p')
+      worktree=$(printf '%s\n' "$env" | sed -n 's/^CRUMB_WORKTREE=//p')
+      ready=-
+      if [ -n "$READY" ] && [ -n "$port" ] && [ "$dead" = 0 ]; then
+        url=$(printf '%s' "$READY" | sed -e "s/{port}/$port/g" -e "s/{local_port}/$port/g")
+        if curl -fsS -m 1 -o /dev/null "$url" 2>/dev/null; then ready=1; else ready=0; fi
+      fi
+      echo "$name $created $dead ${status:-0} ${port:-0} $ready $worktree"
+    done
+}
+
 system() {
   echo "@@mem"
   free -m 2>/dev/null | awk '/^Mem:/ { print $2, $7 }'
@@ -77,10 +97,15 @@ system() {
 containers >"$tmp/containers" 2>"$tmp/containers.err" &
 databases >"$tmp/databases" 2>"$tmp/databases.err" &
 system >"$tmp/system" 2>/dev/null &
+if [ "${RUNTIME:-}" = process ]; then
+  sessions >"$tmp/sessions" 2>/dev/null &
+else
+  : >"$tmp/sessions"
+fi
 wait
 
 echo "@@crumb-probe 1"
-for part in system containers databases; do
+for part in system containers databases sessions; do
   cat "$tmp/$part"
 done
 echo "@@warnings"

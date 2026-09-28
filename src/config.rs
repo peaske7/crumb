@@ -349,12 +349,20 @@ pub const PROJECT_FILE: &str = "crumb.toml";
 
 /// Loads the project's `crumb.toml`, then `~/.config/crumb/config.toml` over
 /// it, then `CRUMB_HOST` and the `--host` flag over both. The user config
-/// holds what differs by machine, such as the host.
-pub fn load(explicit: Option<&Path>, host_flag: Option<&str>) -> Result<Config> {
+/// holds what differs by machine, such as the host. A worktree whose branch
+/// predates crumb.toml uses the main checkout's.
+pub fn load(
+    explicit: Option<&Path>,
+    host_flag: Option<&str>,
+    main: Option<&Path>,
+) -> Result<Config> {
     let mut table = toml::Table::new();
     let source = match explicit {
         Some(path) => Some(path.to_path_buf()),
-        None => find_project_config(&std::env::current_dir()?),
+        None => find_project_config(&std::env::current_dir()?).or_else(|| {
+            main.map(|m| m.join(PROJECT_FILE))
+                .filter(|path| path.is_file())
+        }),
     };
     if let Some(path) = &source {
         merge(&mut table, read_table(path)?);

@@ -1,13 +1,13 @@
 //! `crumb up`: database, sync, port and runtime, forward, wiring, health.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 
 use super::{
-    Ctx, compose_only, ensure_forward, ignore_flags, last_line, mutagen_path, psql, replica,
-    run_command, shell_path, sql_ident, sql_literal, state_root, wait_healthy, wait_sync, wire_all,
+    Ctx, ensure_forward, ignore_flags, last_line, mutagen_path, psql, replica, run_command,
+    sql_ident, sql_literal, state_root, wait_ready, wait_sync, wire_all,
 };
 use crate::config::{DbServer, Forward, Host, Runtime};
 use crate::lease::Lease;
@@ -60,7 +60,7 @@ pub fn up(ctx: &Ctx, lease: &str, worktree: &Path) -> Result<()> {
     };
     vars.set("local_port", local_port.to_string());
     wire_all(ctx, lease, worktree, &vars)?;
-    wait_ready(ctx, lease, local_port, &vars)?;
+    wait_ready(ctx, lease, &vars)?;
     let url = format!("http://127.0.0.1:{local_port}");
     ctx.out.step(
         "Ready",
@@ -421,59 +421,6 @@ fn local_ports_in_use(ctx: &Ctx, facts: &Facts) -> Vec<String> {
     ports.sort_unstable();
     ports.dedup();
     ports.iter().map(u16::to_string).collect()
-}
-
-/// Waits for the backend: Docker's health check for compose, the ready URL
-/// for a process.
-fn wait_ready(ctx: &Ctx, lease: &str, local_port: u16, vars: &Vars) -> Result<()> {
-    let project = ctx.config.project.render(lease);
-    match &ctx.config.runtime {
-        Runtime::Compose { .. } => {
-            compose_only(ctx.config)?;
-            let service = ctx.config.service.as_deref().unwrap_or_default();
-            ctx.out
-                .step("Waiting", &format!("for {service} to be healthy"));
-            let took = wait_healthy(ctx, &project, service)?;
-            ctx.out
-                .step("Healthy", &format!("{service} in {}", duration(took)));
-        }
-        Runtime::Process { ready, .. } => {
-            let _ = local_port;
-            let Some(ready) = ready else {
-                return Ok(());
-            };
-            let url = vars.render(ready);
-            ctx.out.step("Waiting", &format!("for {url}"));
-            let started = Instant::now();
-            loop {
-                let check = format!(
-                    "curl -fsS -m 2 -o /dev/null {} || {{ tmux display-message -p -t {} '#{{pane_dead}}' | grep -qx 1 && echo dead; exit 1; }}",
-                    quote(&url),
-                    quote(&format!("={project}")),
-                );
-                let output = ctx.runner.command(&ctx.config.host, &check)?;
-                if output.status.success() {
-                    ctx.out
-                        .step("Ready", &format!("in {}", duration(started.elapsed())));
-                    return Ok(());
-                }
-                if String::from_utf8_lossy(&output.stdout).contains("dead") {
-                    let log = format!("{}/{lease}/output.log", shell_path(&state_root(ctx.config)));
-                    let tail = ctx
-                        .runner
-                        .command(&ctx.config.host, &format!("tail -n 20 {log}"))
-                        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                        .unwrap_or_default();
-                    bail!("{project} exited before it was ready\n{tail}");
-                }
-                if started.elapsed() > Duration::from_secs(600) {
-                    bail!("{url} did not answer in 10 minutes");
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

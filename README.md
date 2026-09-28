@@ -41,16 +41,17 @@ work against a remote Docker host synced with Mutagen. See
 
 ## Install
 
-From source until the first release:
+Until the first release, from source:
 
 ```sh
 cargo install --git https://github.com/peaske7/crumb
 crumb agents install   # teach Claude Code and Codex to use crumb
 ```
 
-Planned channels: `mise use -g github:peaske7/crumb`,
-`brew install peaske7/tap/crumb`, a shell installer, and
-`cargo binstall crumb-cli`.
+From the first release on: `mise use -g github:peaske7/crumb`, the shell
+installer attached to each GitHub release, `brew install
+peaske7/tap/crumb` and `cargo binstall crumb-cli`. macOS and Linux, arm64 and
+x64.
 
 ## Use
 
@@ -78,7 +79,8 @@ that apply to the selected lease. Down, drop and reap show their plan first.
 
 ## Configure
 
-crumb reads `crumb.toml` from the repository, then
+crumb reads `crumb.toml` from the repository (or its main checkout, for
+branches that predate it; `--config` or `CRUMB_CONFIG` names another), then
 `~/.config/crumb/config.toml` over it for what differs by machine, then
 `CRUMB_HOST` and `--host`. A remote Docker host synced with Mutagen:
 

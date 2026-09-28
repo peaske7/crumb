@@ -97,7 +97,11 @@ pub fn assemble(config: &Config, facts: &Facts, images: &Images, here: Option<&H
 /// Lists this worktree's lease even when nothing runs for it yet.
 fn mark_here(leases: &mut Vec<Lease>, here: &Here) {
     let path = here.worktree.to_string_lossy().into_owned();
-    let index = match leases.iter().position(|l| l.name == here.lease) {
+    // A lease already running from this worktree may have an older name.
+    let running_here = leases
+        .iter()
+        .position(|l| l.live_worktree() == Some(path.as_str()));
+    let index = match running_here.or_else(|| leases.iter().position(|l| l.name == here.lease)) {
         Some(index) => index,
         None => {
             leases.push(Lease::new(&here.lease));
@@ -125,4 +129,33 @@ pub fn collect(config: &Config, runner: &Runner, here: Option<&Here>) -> Result<
         images.fetch(runner, config, id);
     }
     Ok(assemble(config, &facts, &images, here))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn this_worktree_is_its_running_lease_even_under_an_older_name() {
+        let running = Lease {
+            worktree: Some(Worktree {
+                path: "/w/lym-1119-2".into(),
+                exists: true,
+            }),
+            ..Lease::new("lym_1119")
+        };
+        let mut leases = vec![running];
+        let here = Here {
+            lease: "lym_1119_2".into(),
+            worktree: PathBuf::from("/w/lym-1119-2"),
+        };
+        mark_here(&mut leases, &here);
+        assert_eq!(leases.len(), 1);
+        assert!(leases[0].here);
+
+        let mut leases = Vec::new();
+        mark_here(&mut leases, &here);
+        assert_eq!(leases[0].name, "lym_1119_2");
+        assert_eq!(leases[0].group, crate::lease::Group::Running);
+    }
 }

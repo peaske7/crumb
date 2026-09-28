@@ -33,7 +33,7 @@ use crate::worktree::Checkout;
 #[command(name = "crumb", version)]
 struct Cli {
     /// Read this file instead of the nearest crumb.toml.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH", env = "CRUMB_CONFIG")]
     config: Option<PathBuf>,
 
     /// Where leases run: "local" or "ssh://<host>". Overrides the config.
@@ -179,8 +179,17 @@ fn run(cli: Cli, runner: &Runner) -> Result<()> {
         Some(Command::Agents { action }) => return agents(runner, action),
         _ => {}
     }
-    let config = config::load(cli.config.as_deref(), cli.host.as_deref())?;
     let checkout = worktree::find(runner, &std::env::current_dir()?);
+    let config = config::load(
+        cli.config.as_deref(),
+        cli.host.as_deref(),
+        checkout.as_ref().map(|c| c.main.as_path()),
+    )?;
+    if config.repo.is_none() && !matches!(cli.command, Some(Command::Doctor { .. })) {
+        bail!(
+            "no crumb.toml in this repository or its main checkout; `crumb init` writes one, or pass --config"
+        );
+    }
     let here = checkout.as_ref().filter(|c| !c.is_main()).map(|c| Here {
         lease: c.lease(),
         worktree: c.root.clone(),
@@ -243,7 +252,7 @@ fn run(cli: Cli, runner: &Runner) -> Result<()> {
             if !confirmed {
                 bail!("not confirmed; nothing changed");
             }
-            ops::drop(&ctx, &name)
+            ops::drop(&ctx, &name, checkout.as_ref().map(|c| c.root.as_path()))
         }
         Command::Migrate { name } => ops::migrate(&ctx, &name_or_here(&ctx, name, &checkout)?),
         Command::Tunnel { name } => ops::tunnel(&ctx, &name_or_here(&ctx, name, &checkout)?),
@@ -285,7 +294,7 @@ fn init(runner: &Runner, yes: bool, force: bool) -> Result<()> {
     let answers = init::ask(&detected, &repo, yes)?;
     std::fs::write(&path, init::render(&detected, &answers))?;
     eprintln!("wrote {}", path.display());
-    let config = config::load(Some(&path), None)?;
+    let config = config::load(Some(&path), None, None)?;
     let runner = Runner::default();
     let checkout = worktree::find(&runner, &repo);
     let checks = doctor::run(
@@ -412,14 +421,8 @@ fn reap(ctx: &Ctx, yes: bool, dry_run: bool) -> Result<()> {
 fn logs(ctx: &Ctx, name: &str, follow: bool, tail: usize) -> Result<()> {
     let (_, lease) = ctx.lease(name)?;
     let lease = lease.with_context(|| format!("no lease named {name}"))?;
-    let container = lease
-        .container
-        .with_context(|| format!("{name} has no containers"))?;
-    let follow = if follow { " --follow" } else { "" };
-    let command = format!(
-        "docker logs{follow} --tail {tail} {} 2>&1",
-        run::quote(&container)
-    );
+    let command = ops::log_command(ctx.config, &lease, follow, tail)
+        .with_context(|| format!("{name} has no backend to read a log from"))?;
     let status = ctx.runner.attach(&ctx.config.host, &command)?;
     if !status.success() {
         bail!("docker logs exited with {status}");
