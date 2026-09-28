@@ -33,7 +33,7 @@ use crate::worktree::Checkout;
 #[command(name = "crumb", version)]
 struct Cli {
     /// Read this file instead of the nearest crumb.toml.
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH", env = "CRUMB_CONFIG")]
     config: Option<PathBuf>,
 
     /// Where leases run: "local" or "ssh://<host>". Overrides the config.
@@ -185,6 +185,11 @@ fn run(cli: Cli, runner: &Runner) -> Result<()> {
         cli.host.as_deref(),
         checkout.as_ref().map(|c| c.main.as_path()),
     )?;
+    if config.repo.is_none() && !matches!(cli.command, Some(Command::Doctor { .. })) {
+        bail!(
+            "no crumb.toml in this repository or its main checkout; `crumb init` writes one, or pass --config"
+        );
+    }
     let here = checkout.as_ref().filter(|c| !c.is_main()).map(|c| Here {
         lease: c.lease(),
         worktree: c.root.clone(),

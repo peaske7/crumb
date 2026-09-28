@@ -79,7 +79,8 @@ that apply to the selected lease. Down, drop and reap show their plan first.
 
 ## Configure
 
-crumb reads `crumb.toml` from the repository, then
+crumb reads `crumb.toml` from the repository (or its main checkout, for
+branches that predate it; `--config` or `CRUMB_CONFIG` names another), then
 `~/.config/crumb/config.toml` over it for what differs by machine, then
 `CRUMB_HOST` and `--host`. A remote Docker host synced with Mutagen:
 
