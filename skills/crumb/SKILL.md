@@ -1,6 +1,6 @@
 ---
 name: crumb
-description: Run, check and clean up per-worktree development backends ("leases") with the crumb CLI. Use when a git worktree needs its own backend, database or port; when the user asks to start, restart, stop or tear down a worktree's backend; when a backend on a lease is failing, crash-looping or stale; when frontends in a worktree can't reach their backend; or when orphaned leases need reaping. Triggers: "crumb", "lease", "worktree backend", "spin up a backend for this branch", "why doesn't my change show up", "restart pending", "deps behind".
+description: Run, check and clean up per-worktree development backends ("leases") with the crumb CLI. Use when a git worktree needs its own backend, database or port; when the user asks to start, restart, stop or tear down a worktree's backend; when a backend on a lease is failing, crash-looping or stale; when frontends in a worktree can't reach their backend; when orphaned leases need reaping; or when crumb itself fails, misreports a lease, or had to be worked around. Triggers: "crumb", "lease", "worktree backend", "spin up a backend for this branch", "why doesn't my change show up", "restart pending", "deps behind".
 ---
 
 # crumb
@@ -62,3 +62,26 @@ to restart dev servers that read the wired env files.
   `healthy`.
 - `crumb -v <command>` prints every command crumb ran, with timings, when
   something needs debugging.
+
+## When crumb surprises you
+
+crumb gets better from what goes wrong in real use. Report it when a crumb
+command fails with a message that doesn't say what to do, when `crumb ls`
+disagrees with what is actually running, or when you had to reach for
+`docker`, `mutagen` or `ssh` to do something crumb should have done.
+
+1. Finish the user's task first; the report comes after.
+2. Collect the command and its full output, `crumb --version`,
+   `crumb -v <command>` if it happens again, `crumb ls --json` and
+   `crumb doctor --json`. In the TUI, `c` shows the command log and `y`
+   copies it.
+3. Look for an existing issue:
+   `gh issue list --repo peaske7/crumb --state all --search "<words>"`.
+   If one matches, draft a comment on it instead of a new issue.
+4. Draft the issue: what happened, what you expected, the smallest repro,
+   and what crumb could do instead. Show the draft to the user and file it
+   with `gh issue create --repo peaske7/crumb --label observed` only after
+   they say yes.
+5. The repository is public. Leave out host names, IP addresses, user names,
+   home paths, database and project names, env values and anything from the
+   user's data; say "a remote host" or "the shared dev database" instead.
