@@ -179,8 +179,12 @@ fn run(cli: Cli, runner: &Runner) -> Result<()> {
         Some(Command::Agents { action }) => return agents(runner, action),
         _ => {}
     }
-    let config = config::load(cli.config.as_deref(), cli.host.as_deref())?;
     let checkout = worktree::find(runner, &std::env::current_dir()?);
+    let config = config::load(
+        cli.config.as_deref(),
+        cli.host.as_deref(),
+        checkout.as_ref().map(|c| c.main.as_path()),
+    )?;
     let here = checkout.as_ref().filter(|c| !c.is_main()).map(|c| Here {
         lease: c.lease(),
         worktree: c.root.clone(),
@@ -285,7 +289,7 @@ fn init(runner: &Runner, yes: bool, force: bool) -> Result<()> {
     let answers = init::ask(&detected, &repo, yes)?;
     std::fs::write(&path, init::render(&detected, &answers))?;
     eprintln!("wrote {}", path.display());
-    let config = config::load(Some(&path), None)?;
+    let config = config::load(Some(&path), None, None)?;
     let runner = Runner::default();
     let checkout = worktree::find(&runner, &repo);
     let checks = doctor::run(
