@@ -114,6 +114,7 @@ mod tests {
                 path: format!("/work/{name}"),
                 exists: group != Group::Orphaned,
             }),
+            container: None,
             port: Some(8101),
             memory_bytes: Some(300 * 1024 * 1024),
             restarts: 0,

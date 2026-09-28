@@ -49,7 +49,7 @@ Planned channels: `mise use -g github:peaske7/crumb`,
 ## Use
 
 ```sh
-crumb              # the TUI: ↑↓ or j/k to move, ⏎ for details, q to quit
+crumb              # the TUI: j/k move, ⏎ details, l logs, c commands, q quit
 crumb ls           # the same list as text
 crumb ls --json    # for scripts and agents
 crumb ls -v        # also print every command crumb ran, with timings
