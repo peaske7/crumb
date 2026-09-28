@@ -1,0 +1,22 @@
+[package]
+name = "crumb-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A fast, minimal TUI and CLI for per-worktree development backends"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/peaske7/crumb"
+readme = "README.md"
+keywords = ["worktree", "tui", "docker", "mutagen", "dev-environment"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "crumb"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
