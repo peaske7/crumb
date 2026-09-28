@@ -1,0 +1,212 @@
+[
+ {
+  "identifier": "sync_MrtGMusObEfBcEz7hFBKjVY1cCTrd7cmPqP2ho5Rkmm",
+  "name": "main",
+  "labels": {
+   "io.mutagen.project": "proj_PfB7sUQZxVo6PMFgmLO37yJhoI0SZkBWEw7v4HuhGLr"
+  },
+  "paused": false,
+  "status": "watching",
+  "successfulCycles": 649,
+  "mode": "one-way-replica",
+  "alpha": {
+   "protocol": "local",
+   "path": "/Users/dev/work/app",
+   "connected": true,
+   "scanned": true
+  },
+  "beta": {
+   "protocol": "ssh",
+   "host": "indigo",
+   "path": "/home/dev/app",
+   "connected": true,
+   "scanned": true
+  }
+ },
+ {
+  "identifier": "sync_wRmWxZC9P9U0emGxkMJ8pXZxI3AiMz04RcHkU4hC4Aq",
+  "name": "scratch",
+  "paused": false,
+  "status": "watching",
+  "successfulCycles": 637,
+  "mode": "one-way-replica",
+  "alpha": {
+   "protocol": "local",
+   "path": "/tmp/scratch",
+   "connected": true,
+   "scanned": true
+  },
+  "beta": {
+   "protocol": "ssh",
+   "host": "indigo",
+   "path": "/home/dev/scratch",
+   "connected": true,
+   "scanned": true
+  },
+  "conflicts": [
+   {
+    "root": "",
+    "alphaChanges": [
+     {
+      "path": "",
+      "old": {
+       "kind": "directory",
+       "contents": null
+      },
+      "new": null
+     }
+    ],
+    "betaChanges": [
+     {
+      "path": "evals/runner/node_modules",
+      "old": null,
+      "new": {
+       "kind": "untracked"
+      }
+     },
+     {
+      "path": "apps/cli/node_modules",
+      "old": null,
+      "new": {
+       "kind": "untracked"
+      }
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "identifier": "sync_AnrfxXbuibxjRocriieAkYH6noUZiZMtCLtGx1EnAlr",
+  "name": "wt-lym-1127",
+  "labels": {
+   "lymo-worktree": "lym_1127"
+  },
+  "paused": false,
+  "status": "watching",
+  "successfulCycles": 637,
+  "mode": "one-way-replica",
+  "alpha": {
+   "protocol": "local",
+   "path": "/Users/dev/work/lym-1127",
+   "connected": true,
+   "scanned": true
+  },
+  "beta": {
+   "protocol": "ssh",
+   "host": "indigo",
+   "path": "/home/dev/wt/lym_1127",
+   "connected": true,
+   "scanned": true
+  },
+  "conflicts": [
+   {
+    "root": "",
+    "alphaChanges": [
+     {
+      "path": "",
+      "old": {
+       "kind": "directory",
+       "contents": null
+      },
+      "new": null
+     }
+    ],
+    "betaChanges": [
+     {
+      "path": "packages/editor/node_modules",
+      "old": null,
+      "new": {
+       "kind": "untracked"
+      }
+     },
+     {
+      "path": "packages/editor/dist",
+      "old": null,
+      "new": {
+       "kind": "untracked"
+      }
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "identifier": "sync_hkV11pf59ZCGvpRXGiiHgGyYdgE1kwYRhBG43qutfsL",
+  "name": "wt-lym-1136",
+  "labels": {
+   "lymo-worktree": "lym_1136"
+  },
+  "paused": false,
+  "status": "watching",
+  "successfulCycles": 637,
+  "mode": "one-way-replica",
+  "alpha": {
+   "protocol": "local",
+   "path": "/Users/dev/work/lym-1136",
+   "connected": true,
+   "scanned": true
+  },
+  "beta": {
+   "protocol": "ssh",
+   "host": "indigo",
+   "path": "/home/dev/wt/lym_1136",
+   "connected": true,
+   "scanned": true
+  },
+  "conflicts": [
+   {
+    "root": "",
+    "alphaChanges": [
+     {
+      "path": "",
+      "old": {
+       "kind": "directory",
+       "contents": null
+      },
+      "new": null
+     }
+    ],
+    "betaChanges": [
+     {
+      "path": "packages/env/node_modules",
+      "old": null,
+      "new": {
+       "kind": "untracked"
+      }
+     },
+     {
+      "path": "packages/ui/node_modules",
+      "old": null,
+      "new": {
+       "kind": "untracked"
+      }
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "identifier": "sync_A8pNj9HBEyxioQNOEpt8dEIhDhWF7OvS2sZBDdfFBg3",
+  "name": "wt-lym-1119",
+  "labels": {
+   "lymo-worktree": "lym_1119"
+  },
+  "paused": false,
+  "status": "watching",
+  "successfulCycles": 361,
+  "mode": "one-way-replica",
+  "alpha": {
+   "protocol": "local",
+   "path": "/Users/dev/work/lym-1119-2",
+   "connected": true,
+   "scanned": true
+  },
+  "beta": {
+   "protocol": "ssh",
+   "host": "indigo",
+   "path": "/home/dev/wt/lym_1119",
+   "connected": true,
+   "scanned": true
+  }
+ }
+]
