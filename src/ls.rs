@@ -106,28 +106,21 @@ mod tests {
 
     fn lease(name: &str, group: Group, state: State) -> Lease {
         Lease {
-            name: name.into(),
             group,
             state,
-            reasons: vec![],
             worktree: Some(Worktree {
                 path: format!("/work/{name}"),
                 exists: group != Group::Orphaned,
             }),
-            container: None,
-            image: None,
-            watch: vec![],
-            changed_file: None,
-            image_built: None,
             port: Some(8101),
             memory_bytes: Some(300 * 1024 * 1024),
-            restarts: 0,
             since: Some("2026-09-28T11:00:00Z".parse().unwrap()),
-            sync: None,
             database: Some(Database {
                 name: format!("wt_{name}"),
                 comment: None,
+                applied: None,
             }),
+            ..Lease::new(name)
         }
     }
 

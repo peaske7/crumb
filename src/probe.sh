@@ -1,6 +1,7 @@
 # crumb probe: prints the host-side facts crumb needs in one pass.
 # Sent on stdin (`bash -s`), so nothing is installed on the host. crumb
-# prepends PROJECT_PREFIX, DB_DOCKER, DB_URL, DB_USER and DB_LIKE assignments.
+# prepends PROJECT_PREFIX, DB_DOCKER, DB_URL, DB_USER, DB_LIKE and SCHEMA_QUERY
+# assignments.
 #
 # Never print container environment variables: they hold secrets.
 #
@@ -16,7 +17,7 @@ containers() {
   echo "@@containers"
   if [ -n "$ids" ]; then
     # shellcheck disable=SC2086
-    docker inspect --format '{"id":{{json .Id}},"name":{{json .Name}},"status":{{json .State.Status}},"exit_code":{{.State.ExitCode}},"started_at":{{json .State.StartedAt}},"finished_at":{{json .State.FinishedAt}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},"restarts":{{.RestartCount}},"labels":{{json .Config.Labels}},"image":{{json .Image}},"mounts":{{json .Mounts}},"ports":{{json .NetworkSettings.Ports}},"bindings":{{json .HostConfig.PortBindings}}}' $ids
+    docker inspect --format '{"id":{{json .Id}},"name":{{json .Name}},"status":{{json .State.Status}},"exit_code":{{.State.ExitCode}},"oom_killed":{{.State.OOMKilled}},"started_at":{{json .State.StartedAt}},"finished_at":{{json .State.FinishedAt}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},"restarts":{{.RestartCount}},"labels":{{json .Config.Labels}},"image":{{json .Image}},"mounts":{{json .Mounts}},"ports":{{json .NetworkSettings.Ports}},"bindings":{{json .HostConfig.PortBindings}}}' $ids
   fi
   echo "@@memory"
   for id in $ids; do
@@ -25,13 +26,40 @@ containers() {
   done
 }
 
-databases() {
-  echo "@@databases"
-  query="select coalesce(json_agg(json_build_object('name', datname, 'comment', shobj_description(oid, 'pg_database')) order by datname), '[]') from pg_database where datname like '$DB_LIKE'"
+# psql on the configured server, in database $1.
+psql_in() {
   if [ -n "${DB_DOCKER:-}" ]; then
-    docker exec "$DB_DOCKER" psql -U "${DB_USER:-postgres}" -d postgres -Atc "$query"
+    docker exec "$DB_DOCKER" psql -U "${DB_USER:-postgres}" -d "$1" -Atc "$2"
   elif [ -n "${DB_URL:-}" ]; then
-    psql "$DB_URL" -Atc "$query"
+    base="${DB_URL%%\?*}"
+    params=""
+    case "$DB_URL" in *\?*) params="?${DB_URL#*\?}" ;; esac
+    case "${base#*://}" in */*) base="${base%/*}" ;; esac
+    psql "$base/$1$params" -Atc "$2"
+  fi
+}
+
+databases() {
+  [ -n "${DB_DOCKER:-}${DB_URL:-}" ] || return 0
+  query="select coalesce(json_agg(json_build_object('name', datname, 'comment', shobj_description(oid, 'pg_database')) order by datname), '[]') from pg_database where datname like '$DB_LIKE'"
+  list=$(psql_in postgres "$query")
+  echo "@@databases"
+  echo "$list"
+  [ -n "${SCHEMA_QUERY:-}" ] || return 0
+  echo "@@schema"
+  names=$(printf '%s' "$list" | grep -o '"name" *: *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/')
+  [ -n "$names" ] || return 0
+  if [ -n "${DB_DOCKER:-}" ]; then
+    # One docker exec for every database: each exec costs about 100 ms.
+    # shellcheck disable=SC2086,SC2016
+    docker exec -e Q="$SCHEMA_QUERY" -e U="${DB_USER:-postgres}" "$DB_DOCKER" sh -c \
+      'for db in "$@"; do (echo "$db $(psql -U "$U" -d "$db" -Atc "$Q" 2>/dev/null | head -n 1)") & done; wait' \
+      sh $names
+  else
+    for db in $names; do
+      (echo "$db $(psql_in "$db" "$SCHEMA_QUERY" 2>/dev/null | head -n 1)") &
+    done
+    wait
   fi
 }
 
@@ -41,6 +69,8 @@ system() {
   echo "@@listeners"
   if command -v ss >/dev/null 2>&1; then
     ss -ltnH 2>/dev/null | awk '{ print $4 }'
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { print $9 }'
   fi
 }
 

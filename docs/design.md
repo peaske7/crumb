@@ -109,7 +109,7 @@ set.DATABASE_URL = "{database.url}"
 - `~/.config/crumb/config.toml` holds machine-specific values such as the SSH
   host, so teammates share one project config.
 - Precedence: flags, then `CRUMB_*` environment variables, then the user
-  config, then the project config.
+  config, then the project config. Unknown keys are errors.
 - Templates: `{lease}`, `{n}`, `{port}`, `{local_port}`, `{worktree}`,
   `{host}`, and any field a command prints (`{database.url}`).
 
@@ -121,9 +121,10 @@ with it:
 
 | Piece        | Owner              | Name                 | Metadata                                                          |
 | ------------ | ------------------ | -------------------- | ----------------------------------------------------------------- |
-| Code sync    | Mutagen daemon     | `wt-<lease>`         | label `crumb.lease=<lease>`                                       |
-| Port forward | Mutagen daemon     | `wt-<lease>-api`     | label `crumb.lease=<lease>`                                       |
+| Code sync    | Mutagen daemon     | project, `_` → `-`   | label `crumb.lease=<lease>`                                       |
+| Port forward | Mutagen daemon     | the same, `-port`    | label `crumb.lease=<lease>`                                       |
 | Replica      | host filesystem    | `<root>/<lease>`     | the path is the name                                              |
+| Compose state| host filesystem    | `<root>/.crumb/<lease>` | the compose file and the labels override `up` streamed there   |
 | Containers   | Docker             | project from config  | labels `crumb.lease`, `crumb.port`, `crumb.db`, `crumb.worktree`  |
 | Database     | Postgres           | name from config     | `COMMENT ON DATABASE` with worktree path, source and time         |
 | Wiring       | the worktree       | configured env files | first-line marker `# crumb lease <lease>`                         |
@@ -162,7 +163,16 @@ port.
 - Compose runs on the host (over SSH for remote hosts). Running compose from
   this machine against a remote daemon resolves bind mounts and env files to
   local paths.
-- The compose file is streamed to the host on each `up`.
+- The compose file is streamed to the host on each `up`, from the worktree
+  (or the main checkout for branches that predate it). crumb labels the
+  service through a second, generated compose file, so the project's file
+  needs only `127.0.0.1:${CRUMB_PORT}:<port>` and may use `${CRUMB_DATABASE}`
+  and `${CRUMB_LEASE}`.
+- Health is Docker's health check; a service without one counts as ready
+  after three seconds running. `up` fails fast, with the log's error lines,
+  when the container exits or restarts while it waits.
+- Exit codes 137 and 143 without an out-of-memory kill are `docker stop`, so
+  the lease reads "stopped", not "exited".
 - Recommended restart policy: `on-failure:5`. It caps crash loops, and leases
   stay stopped after a host reboot instead of all starting at once.
 - Dependency drift: the SHA-256 of the lockfile inside the image (computed
@@ -221,13 +231,15 @@ example an Orca archive hook) can call `crumb down`; reap catches the rest.
 
 ## Command contract
 
-A command driver receives `CRUMB_LEASE`, `CRUMB_WORKTREE`, `CRUMB_PORT`,
-`CRUMB_LOCAL_PORT` and `CRUMB_HOST`. It writes progress to stderr, exits 0 on
-success, and may print one JSON object on stdout; its fields become template
-variables and status (`{"url": "...", "state": "ok", "detail": "..."}`).
-Commands run on actions and when a lease's details are opened, never in the
-refresh loop. Orca environment recipes and Conductor scripts use the same
-shape.
+A command driver runs on this machine in the lease's worktree and receives
+`CRUMB_LEASE`, `CRUMB_WORKTREE`, `CRUMB_PORT`, `CRUMB_LOCAL_PORT`,
+`CRUMB_DATABASE` and `CRUMB_HOST`. Its output lines show as progress. It
+exits 0 on success and may print one JSON object on a line of its own; the
+fields become template variables under the command's piece
+(`{"url": "..."}` from `database.create` is `{database.url}`). A create
+command must be idempotent: when the database exists it exits 0 and prints
+the same fields. Commands run only on actions, never in the refresh loop.
+Orca environment recipes and Conductor scripts use the same shape.
 
 ## Interface
 

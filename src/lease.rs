@@ -3,9 +3,11 @@ use std::collections::BTreeMap;
 use jiff::Timestamp;
 use serde::Serialize;
 
-use crate::config::{Config, Host};
-use crate::mutagen::SyncSession;
+use crate::config::{Config, Forward, Host};
+use crate::mutagen::{ForwardSession, SyncSession};
 use crate::probe::{Binding, Container, DatabaseFact, HostFacts};
+use crate::template::Vars;
+use crate::wire;
 
 /// Five failed starts in a row without becoming healthy is a crash loop.
 const CRASH_LOOP_RESTARTS: u64 = 5;
@@ -57,13 +59,29 @@ pub enum Reason {
     RestartPending,
     /// The worktree's lockfile differs from the one in the image.
     DepsBehind,
+    /// The worktree has migrations the lease database has not applied.
+    SchemaBehind,
+    /// Nothing forwards the lease's port to this machine.
+    NoForward,
+    /// A wired env file is missing or points somewhere else.
+    WiringStale,
+    /// A wired env file points at a non-loopback host.
+    WiringRemote,
 }
 
 impl Reason {
     /// Soft reasons mean "behind", not "broken": the lease stays in its group
     /// and says so in its status.
     pub fn is_soft(&self) -> bool {
-        matches!(self, Reason::RestartPending | Reason::DepsBehind)
+        matches!(
+            self,
+            Reason::RestartPending
+                | Reason::DepsBehind
+                | Reason::SchemaBehind
+                | Reason::NoForward
+                | Reason::WiringStale
+                | Reason::WiringRemote
+        )
     }
 }
 
@@ -84,25 +102,105 @@ pub struct Lease {
     pub changed_file: Option<String>,
     /// When the image the backend runs was built, once it is known.
     pub image_built: Option<Timestamp>,
+    /// The port on the host.
     pub port: Option<u16>,
+    /// The port on this machine: the forward's, or the host's when direct.
+    pub local_port: Option<u16>,
     pub memory_bytes: Option<u64>,
     pub restarts: u64,
     /// When the main container started (running) or stopped (otherwise).
     pub since: Option<Timestamp>,
     pub sync: Option<Sync>,
+    pub forward: Option<PortForward>,
     pub database: Option<Database>,
+    /// The newest migration in the worktree, when the schema check runs.
+    pub newest_migration: Option<String>,
+    pub wiring: Vec<Wiring>,
+    /// The worktree crumb was started in, listed even before it has a lease.
+    pub here: bool,
 }
 
 impl Lease {
+    pub fn new(name: &str) -> Self {
+        Lease {
+            name: name.to_string(),
+            group: Group::Running,
+            state: State::Absent,
+            reasons: Vec::new(),
+            worktree: None,
+            container: None,
+            image: None,
+            watch: Vec::new(),
+            changed_file: None,
+            image_built: None,
+            port: None,
+            local_port: None,
+            memory_bytes: None,
+            restarts: 0,
+            since: None,
+            sync: None,
+            forward: None,
+            database: None,
+            newest_migration: None,
+            wiring: Vec::new(),
+            here: false,
+        }
+    }
+
     pub fn worktree_gone(&self) -> bool {
         self.worktree.as_ref().is_some_and(|w| !w.exists)
+    }
+
+    /// The worktree path when it still exists on this machine.
+    pub fn live_worktree(&self) -> Option<&str> {
+        self.worktree
+            .as_ref()
+            .filter(|w| w.exists)
+            .map(|w| w.path.as_str())
+    }
+
+    /// Whether the backend is up in some form, so its checks mean something.
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.state,
+            State::Healthy | State::Running | State::Starting | State::Unhealthy
+        )
+    }
+
+    /// Template values for this lease's commands and wired files.
+    pub fn vars(&self, config: &Config) -> Vars {
+        let mut vars = Vars::default();
+        vars.set("lease", self.name.as_str())
+            .set("host", config.host.label());
+        if let Some(worktree) = &self.worktree {
+            vars.set("worktree", worktree.path.as_str());
+        }
+        if let Some(port) = self.port {
+            vars.set("port", port.to_string());
+            if let Some(nn) = port.checked_sub(config.host_base).filter(|nn| *nn < 100) {
+                vars.set("n", format!("{nn:02}"));
+            }
+        }
+        if let Some(port) = self.local_port {
+            vars.set("local_port", port.to_string());
+        }
+        let database = self.database.as_ref().map(|d| d.name.clone()).or_else(|| {
+            config
+                .database
+                .as_ref()
+                .map(|db| db.name.render(&self.name))
+        });
+        if let Some(database) = database {
+            vars.set("database", database);
+        }
+        vars
     }
 
     /// Places the lease by what to do about it. Call again after adding reasons.
     pub fn regroup(&mut self) {
         self.group = if self.worktree_gone() {
             Group::Orphaned
-        } else if self.state == State::Absent && self.sync.is_none() {
+        } else if self.state == State::Absent && self.sync.is_none() && !self.here {
             Group::DatabaseOnly
         } else if self.reasons.iter().any(|r| !r.is_soft()) {
             Group::NeedsYou
@@ -129,15 +227,34 @@ pub struct Sync {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct PortForward {
+    pub session: String,
+    pub local_port: Option<u16>,
+    pub remote_port: Option<u16>,
+    pub up: bool,
+    pub paused: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Database {
     pub name: String,
     pub comment: Option<String>,
+    /// The newest migration version applied, when the schema check runs.
+    pub applied: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Wiring {
+    pub file: String,
+    pub status: wire::Status,
 }
 
 #[derive(Default)]
 struct Parts<'a> {
     containers: Vec<&'a Container>,
     sync: Option<&'a SyncSession>,
+    forward: Option<&'a ForwardSession>,
     database: Option<&'a DatabaseFact>,
 }
 
@@ -147,6 +264,7 @@ pub fn join(
     config: &Config,
     host: &HostFacts,
     syncs: &[SyncSession],
+    forwards: &[ForwardSession],
     exists: impl Fn(&str) -> bool,
 ) -> Vec<Lease> {
     let mut parts: BTreeMap<String, Parts> = BTreeMap::new();
@@ -165,6 +283,11 @@ pub fn join(
     for session in syncs {
         if let Some(lease) = session.lease(&config.label_keys) {
             parts.entry(lease.to_string()).or_default().sync = Some(session);
+        }
+    }
+    for session in forwards {
+        if let Some(lease) = session.lease(&config.label_keys) {
+            parts.entry(lease.to_string()).or_default().forward = Some(session);
         }
     }
     if let Some(db) = &config.database {
@@ -224,10 +347,35 @@ fn build(
     let database = parts.database.map(|d| Database {
         name: d.name.clone(),
         comment: d.comment.clone(),
+        applied: host.schema.get(&d.name).cloned(),
     });
+    let forward = parts.forward.map(|f| PortForward {
+        session: f.name.clone(),
+        local_port: f.source.port(),
+        remote_port: f.destination.port(),
+        up: f.up(),
+        paused: f.paused,
+        error: f.last_error.clone().filter(|e| !e.is_empty()),
+    });
+    let port = main.and_then(|c| published_port(config, c));
+    let local_port = match config.forward {
+        Forward::Direct => port,
+        Forward::Mutagen => forward.as_ref().and_then(|f| f.local_port),
+    };
 
     let gone = worktree.as_ref().is_some_and(|w| !w.exists);
-    let reasons = reasons(&state, gone, sync.as_ref());
+    let mut reasons = reasons(&state, gone, sync.as_ref());
+    let forward_down = forward
+        .as_ref()
+        .is_none_or(|f| !f.up || f.remote_port != port);
+    if config.forward == Forward::Mutagen
+        && !gone
+        && port.is_some()
+        && running(&state)
+        && forward_down
+    {
+        reasons.push(Reason::NoForward);
+    }
 
     let mut lease = Lease {
         name,
@@ -237,7 +385,8 @@ fn build(
         watch: main.map(watched_paths).unwrap_or_default(),
         changed_file: None,
         image_built: None,
-        port: main.and_then(|c| published_port(config, c)),
+        port,
+        local_port,
         memory_bytes: (!memory.is_empty()).then(|| memory.iter().sum()),
         restarts: main.map_or(0, |c| c.restarts),
         since: main.and_then(since),
@@ -245,10 +394,21 @@ fn build(
         reasons,
         worktree,
         sync,
+        forward,
         database,
+        newest_migration: None,
+        wiring: Vec::new(),
+        here: false,
     };
     lease.regroup();
     lease
+}
+
+fn running(state: &State) -> bool {
+    matches!(
+        state,
+        State::Healthy | State::Running | State::Starting | State::Unhealthy
+    )
 }
 
 /// The main container's bind mounts that come from its project directory,
@@ -337,6 +497,9 @@ fn state_of(container: Option<&Container>) -> State {
             Some("unhealthy") => State::Unhealthy,
             _ => State::Running,
         },
+        // 137 and 143 are SIGKILL and SIGTERM: `docker stop`, unless the
+        // kernel killed it for memory.
+        "exited" if matches!(c.exit_code, 137 | 143) && !c.oom_killed => State::Stopped,
         "exited" | "dead" if c.exit_code != 0 => State::Exited { code: c.exit_code },
         _ => State::Stopped,
     }
@@ -391,24 +554,27 @@ fn published_port(config: &Config, c: &Container) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Database as DbConfig, DbServer, Pattern};
     use crate::{mutagen, probe};
 
     fn config() -> Config {
-        Config {
-            host: Host::Ssh("devbox".into()),
-            mutagen: true,
-            label_keys: vec!["crumb.lease".into(), "lymo-worktree".into()],
-            project: Pattern::parse("wt_{lease}").unwrap(),
-            service: Some("backend".into()),
-            port: Some(8080),
-            database: Some(DbConfig {
-                name: Pattern::parse("wt_{lease}").unwrap(),
-                server: DbServer::Docker("db".into()),
-                user: "postgres".into(),
-            }),
-            deps: None,
-        }
+        Config::parse(
+            r#"
+            host = "ssh://devbox"
+            [code]
+            sync = "mutagen"
+            label_keys = ["crumb.lease", "lymo-worktree"]
+            [runtime]
+            project = "wt_{lease}"
+            service = "backend"
+            port = 8080
+            [ports]
+            forward = "direct"
+            [database]
+            name = "wt_{lease}"
+            server = "docker://db"
+            "#,
+        )
+        .unwrap()
     }
 
     fn facts() -> (HostFacts, Vec<SyncSession>) {
@@ -437,7 +603,7 @@ mod tests {
     #[test]
     fn one_row_per_lease_across_containers_syncs_and_databases() {
         let (host, syncs) = facts();
-        let leases = join(&config(), &host, &syncs, present);
+        let leases = join(&config(), &host, &syncs, &[], present);
         let mut names: Vec<_> = leases.iter().map(|l| l.name.as_str()).collect();
         names.sort();
         assert_eq!(
@@ -460,7 +626,7 @@ mod tests {
     #[test]
     fn a_lease_whose_worktree_is_gone_is_orphaned() {
         let (host, syncs) = facts();
-        let leases = join(&config(), &host, &syncs, present);
+        let leases = join(&config(), &host, &syncs, &[], present);
         let orphan = find(&leases, "lym_1136");
         assert_eq!(orphan.group, Group::Orphaned);
         assert_eq!(orphan.state, State::Healthy);
@@ -474,7 +640,7 @@ mod tests {
     #[test]
     fn a_database_alone_is_database_only() {
         let (host, syncs) = facts();
-        let leases = join(&config(), &host, &syncs, present);
+        let leases = join(&config(), &host, &syncs, &[], present);
         let db_only = find(&leases, "saml_sso");
         assert_eq!(db_only.group, Group::DatabaseOnly);
         assert_eq!(db_only.state, State::Absent);
@@ -485,7 +651,7 @@ mod tests {
     fn a_healthy_lease_with_its_worktree_is_running() {
         let (mut host, syncs) = facts();
         container(&mut host, "/wt_lym_1119-backend-1").health = Some("healthy".into());
-        let leases = join(&config(), &host, &syncs, present);
+        let leases = join(&config(), &host, &syncs, &[], present);
         let lease = find(&leases, "lym_1119");
         assert_eq!(lease.group, Group::Running);
         assert_eq!(lease.state, State::Healthy);
@@ -500,7 +666,7 @@ mod tests {
         backend.status = "exited".into();
         backend.exit_code = 1;
         backend.finished_at = "2026-09-28T11:39:12Z".into();
-        let leases = join(&config(), &host, &syncs, present);
+        let leases = join(&config(), &host, &syncs, &[], present);
         let lease = find(&leases, "lym_1119");
         assert_eq!(lease.group, Group::NeedsYou);
         assert_eq!(lease.state, State::Exited { code: 1 });
@@ -511,10 +677,23 @@ mod tests {
     }
 
     #[test]
+    fn a_backend_killed_by_docker_stop_is_stopped_not_exited() {
+        let (mut host, syncs) = facts();
+        let backend = container(&mut host, "/wt_lym_1119-backend-1");
+        backend.status = "exited".into();
+        backend.exit_code = 137;
+        let leases = join(&config(), &host, &syncs, &[], present);
+        assert_eq!(find(&leases, "lym_1119").state, State::Stopped);
+        container(&mut host, "/wt_lym_1119-backend-1").oom_killed = true;
+        let leases = join(&config(), &host, &syncs, &[], present);
+        assert_eq!(find(&leases, "lym_1119").state, State::Exited { code: 137 });
+    }
+
+    #[test]
     fn many_restarts_without_health_is_a_crash_loop() {
         // Captured as it was: running, health "starting", restarted all week.
         let (host, syncs) = facts();
-        let leases = join(&config(), &host, &syncs, present);
+        let leases = join(&config(), &host, &syncs, &[], present);
         let lease = find(&leases, "lym_1127");
         assert_eq!(lease.state, State::CrashLoop { restarts: 26_279 });
         assert_eq!(lease.group, Group::Orphaned);
@@ -525,7 +704,7 @@ mod tests {
     fn groups_sort_by_urgency_then_name() {
         let (mut host, syncs) = facts();
         container(&mut host, "/wt_lym_1119-backend-1").status = "restarting".into();
-        let leases = join(&config(), &host, &syncs, present);
+        let leases = join(&config(), &host, &syncs, &[], present);
         assert_eq!(leases[0].group, Group::NeedsYou);
         assert!(
             leases
@@ -548,7 +727,7 @@ mod tests {
             mount("bind", "/home/dev/wt/lym_1119/apps/backend/src"),
             mount("volume", "/var/lib/docker/volumes/x/_data"),
         ]);
-        let leases = join(&config(), &host, &syncs, present);
+        let leases = join(&config(), &host, &syncs, &[], present);
         assert_eq!(
             find(&leases, "lym_1119").watch,
             ["apps/backend/src", "packages"]
@@ -562,7 +741,7 @@ mod tests {
         let labels = backend.labels.get_or_insert_default();
         labels.insert("crumb.port".into(), "8199".into());
         labels.insert("crumb.worktree".into(), "/Users/dev/work/lym-1119-2".into());
-        let leases = join(&config(), &host, &syncs, present);
+        let leases = join(&config(), &host, &syncs, &[], present);
         let lease = find(&leases, "lym_1136");
         assert_eq!(lease.port, Some(8199));
         assert!(lease.worktree.as_ref().is_some_and(|w| w.exists));
@@ -570,11 +749,31 @@ mod tests {
     }
 
     #[test]
+    fn a_running_lease_without_its_forward_is_behind() {
+        let (mut host, syncs) = facts();
+        container(&mut host, "/wt_lym_1119-backend-1").health = Some("healthy".into());
+        let mut config = config();
+        config.forward = Forward::Mutagen;
+        let leases = join(&config, &host, &syncs, &[], present);
+        let lease = find(&leases, "lym_1119");
+        assert_eq!(lease.reasons, [Reason::NoForward]);
+        assert_eq!(lease.group, Group::Running);
+        assert_eq!(lease.local_port, None);
+
+        let forwards =
+            mutagen::parse(include_str!("../tests/fixtures/mutagen-forward.json")).unwrap();
+        let leases = join(&config, &host, &syncs, &forwards, present);
+        let lease = find(&leases, "lym_1119");
+        assert!(lease.reasons.is_empty());
+        assert_eq!(lease.local_port, Some(18107));
+    }
+
+    #[test]
     fn sync_problems_on_a_live_worktree_need_you() {
         let (host, mut syncs) = facts();
         let session = syncs.iter_mut().find(|s| s.name == "wt-lym-1119").unwrap();
         session.paused = true;
-        let leases = join(&config(), &host, &syncs, present);
+        let leases = join(&config(), &host, &syncs, &[], present);
         let lease = find(&leases, "lym_1119");
         assert_eq!(lease.group, Group::NeedsYou);
         assert!(lease.reasons.contains(&Reason::SyncPaused));

@@ -33,14 +33,18 @@ pub fn status(lease: &Lease, now: Timestamp) -> (String, Tone) {
         Some(since) => format!("up {}", age(since, now)),
         None => "up".to_string(),
     };
-    // A running lease that is behind says so instead of how long it has run.
-    if lease.group == Group::Running {
-        if lease.reasons.contains(&Reason::DepsBehind) {
-            return ("deps behind".to_string(), Tone::Warn);
-        }
-        if lease.reasons.contains(&Reason::RestartPending) {
-            return ("restart pending".to_string(), Tone::Warn);
-        }
+    // A running lease that is behind says so instead of how long it has run,
+    // naming the thing most likely to bite first.
+    if lease.group == Group::Running
+        && let Some(reason) = BEHIND.iter().find(|r| lease.reasons.contains(r))
+    {
+        let text = match reason {
+            Reason::WiringRemote => remote_wiring(lease)
+                .map(|(_, url)| format!("wired to {}", url_host(&url)))
+                .unwrap_or_else(|| "wired remote".to_string()),
+            reason => behind_word(reason).to_string(),
+        };
+        return (text, Tone::Warn);
     }
     match &lease.state {
         State::Healthy if lease.group == Group::Orphaned => (up(), Tone::Dim),
@@ -53,8 +57,45 @@ pub fn status(lease: &Lease, now: Timestamp) -> (String, Tone) {
         }
         State::Exited { code } => (with_age(format!("exited {code}"), " ago"), Tone::Bad),
         State::Stopped => (with_age("stopped".into(), " ago"), Tone::Dim),
+        State::Absent if lease.sync.is_none() => ("not started".to_string(), Tone::Dim),
         State::Absent => ("no containers".to_string(), Tone::Warn),
     }
+}
+
+/// Behind reasons, most urgent first.
+const BEHIND: [Reason; 6] = [
+    Reason::DepsBehind,
+    Reason::SchemaBehind,
+    Reason::WiringRemote,
+    Reason::NoForward,
+    Reason::WiringStale,
+    Reason::RestartPending,
+];
+
+fn behind_word(reason: &Reason) -> &'static str {
+    match reason {
+        Reason::DepsBehind => "deps behind",
+        Reason::SchemaBehind => "schema behind",
+        Reason::NoForward => "no forward",
+        Reason::WiringStale => "wiring stale",
+        _ => "restart pending",
+    }
+}
+
+fn remote_wiring(lease: &Lease) -> Option<(String, String)> {
+    lease.wiring.iter().find_map(|w| match &w.status {
+        crate::wire::Status::Remote { url } => Some((w.file.clone(), url.clone())),
+        _ => None,
+    })
+}
+
+/// `http://100.64.0.1:8107/x` → `100.64.0.1`.
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host)
 }
 
 pub fn worktree(lease: &Lease) -> (String, Tone) {
@@ -68,8 +109,13 @@ pub fn worktree(lease: &Lease) -> (String, Tone) {
     }
 }
 
+/// The port to use from this machine: the forward's when there is one.
 pub fn port(lease: &Lease) -> String {
-    lease.port.map(|p| format!(":{p}")).unwrap_or_default()
+    lease
+        .local_port
+        .or(lease.port)
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default()
 }
 
 pub fn memory(bytes: u64) -> String {
@@ -168,6 +214,58 @@ pub fn reasons(lease: &Lease, now: Timestamp) -> Vec<(&'static str, String, Tone
                     Tone::Warn,
                 )
             }
+            Reason::SchemaBehind => (
+                "schema",
+                format!(
+                    "migrations reach {}; the database has {}. m migrates",
+                    lease.newest_migration.as_deref().unwrap_or("?"),
+                    lease
+                        .database
+                        .as_ref()
+                        .and_then(|d| d.applied.as_deref())
+                        .unwrap_or("?"),
+                ),
+                Tone::Warn,
+            ),
+            Reason::NoForward => {
+                let port = lease.port.map(|p| format!(":{p}")).unwrap_or_default();
+                let text = match &lease.forward {
+                    None => format!("nothing forwards {port} to this machine; t creates it"),
+                    Some(f) if f.paused => "the forward is paused; t resumes it".to_string(),
+                    Some(f) if f.remote_port != lease.port => format!(
+                        "the forward points at :{}, the backend is on {port}; t fixes it",
+                        f.remote_port.unwrap_or_default()
+                    ),
+                    Some(f) => format!(
+                        "the forward is not connected{}; t recreates it",
+                        f.error.as_ref().map(|e| format!(": {e}")).unwrap_or_default()
+                    ),
+                };
+                ("port", text, Tone::Warn)
+            }
+            Reason::WiringStale => {
+                let files: Vec<&str> = lease
+                    .wiring
+                    .iter()
+                    .filter(|w| w.status != crate::wire::Status::Ok)
+                    .map(|w| w.file.as_str())
+                    .collect();
+                (
+                    "wiring",
+                    format!("{} missing or out of date; t rewrites", files.join(", ")),
+                    Tone::Warn,
+                )
+            }
+            Reason::WiringRemote => {
+                let (file, url) = remote_wiring(lease).unwrap_or_default();
+                (
+                    "wiring",
+                    format!(
+                        "{file} points at {url}; WebSocket clients upgrade non-loopback hosts to wss:, so live connections fail. t rewires through a forward"
+                    ),
+                    Tone::Warn,
+                )
+            }
         })
         .collect()
 }
@@ -245,6 +343,34 @@ pub fn pad(text: &str, to: usize) -> String {
 pub fn total_memory<'a>(leases: impl IntoIterator<Item = &'a Lease>) -> Option<u64> {
     let total: u64 = leases.into_iter().filter_map(|l| l.memory_bytes).sum();
     (total > 0).then_some(total)
+}
+
+/// Word-wraps `text` to `width` columns; a word longer than a line is split.
+pub fn wrap(text: &str, columns: usize) -> Vec<String> {
+    let columns = columns.max(10);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let mut word = word.to_string();
+        while width(&word) > columns {
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            lines.push(word.chars().take(columns).collect());
+            word = word.chars().skip(columns).collect();
+        }
+        if !line.is_empty() && width(&line) + 1 + width(&word) > columns {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&word);
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Whether a log line reports a failure.
@@ -363,6 +489,20 @@ mod tests {
         assert_eq!(ago("2026-09-28T11:38:00Z"), "22m");
         assert_eq!(ago("2026-09-28T07:00:00Z"), "5h");
         assert_eq!(ago("2026-09-23T12:00:00Z"), "5d");
+    }
+
+    #[test]
+    fn wraps_at_word_boundaries() {
+        assert_eq!(
+            wrap("points at http://100.64.0.1:8107; live sockets fail", 20),
+            [
+                "points at",
+                "http://100.64.0.1:81",
+                "07; live sockets",
+                "fail"
+            ]
+        );
+        assert_eq!(wrap("", 20), [""]);
     }
 
     #[test]

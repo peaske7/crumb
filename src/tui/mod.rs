@@ -2,6 +2,7 @@
 //! with `esc`. All I/O runs on background threads; the screen redraws only
 //! when a key or new data arrives.
 
+mod actions;
 mod commands;
 mod list;
 mod logs;
@@ -21,12 +22,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 
+use actions::{Activity, Answer, Pending, TuiProgress};
+
 use crate::checks::Images;
-use crate::config::{Config, Host};
-use crate::lease::Lease;
+use crate::config::{Config, Forward, Host};
+use crate::lease::{Group, Lease};
+use crate::ops::{self, Ctx};
 use crate::run::Runner;
-use crate::snapshot::{self, Snapshot};
+use crate::snapshot::{self, Here, Snapshot};
 use crate::view::{self, Tone};
+use crate::worktree::Checkout;
 
 const REFRESH: Duration = Duration::from_secs(3);
 const GAP: &str = "   ";
@@ -43,23 +48,44 @@ enum Msg {
         key: ExcerptKey,
         result: Result<Vec<String>, String>,
     },
+    /// A step or output line from a running action.
+    Progress {
+        lease: String,
+        line: String,
+        step: bool,
+    },
+    Done {
+        lease: String,
+        result: Result<(), String>,
+    },
 }
 
-pub fn run(config: Config) -> Result<()> {
+pub fn run(
+    config: Config,
+    runner: Runner,
+    checkout: Option<Checkout>,
+    here: Option<Here>,
+) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    let runner = Runner::default();
-    spawn_refresh(config.clone(), runner.clone(), tx.clone());
+    let (poke, poked) = mpsc::channel();
+    spawn_refresh(config.clone(), runner.clone(), tx.clone(), poked, here);
     spawn_input(tx.clone());
     let mut terminal = ratatui::init();
-    let result = App::new(config.host, runner, tx).run(&mut terminal, &rx);
+    let result = App::new(config, runner, tx, poke, checkout).run(&mut terminal, &rx);
     ratatui::restore();
     result
 }
 
 /// Reads on its own thread so the screen never waits on the network. A new
 /// image's facts take about a second, so the list is sent first and sent
-/// again once they arrive.
-fn spawn_refresh(config: Config, runner: Runner, tx: Sender<Msg>) {
+/// again once they arrive. A poke refreshes at once, as after an action.
+fn spawn_refresh(
+    config: Config,
+    runner: Runner,
+    tx: Sender<Msg>,
+    poked: Receiver<()>,
+    here: Option<Here>,
+) {
     thread::spawn(move || {
         let mut images = Images::default();
         let send = |result: Result<Snapshot>| tx.send(Msg::Snapshot(Box::new(result))).is_ok();
@@ -67,14 +93,19 @@ fn spawn_refresh(config: Config, runner: Runner, tx: Sender<Msg>) {
             let open = match snapshot::gather(&config, &runner) {
                 Err(err) => send(Err(err)),
                 Ok(facts) => {
-                    let first = snapshot::assemble(&config, &facts, &images);
+                    let first = snapshot::assemble(&config, &facts, &images, here.as_ref());
                     let missing = images.missing(&config, &first.leases);
                     let mut open = send(Ok(first));
                     if open && !missing.is_empty() {
                         for id in &missing {
                             images.fetch(&runner, &config, id);
                         }
-                        open = send(Ok(snapshot::assemble(&config, &facts, &images)));
+                        open = send(Ok(snapshot::assemble(
+                            &config,
+                            &facts,
+                            &images,
+                            here.as_ref(),
+                        )));
                     }
                     open
                 }
@@ -82,7 +113,10 @@ fn spawn_refresh(config: Config, runner: Runner, tx: Sender<Msg>) {
             if !open {
                 break;
             }
-            thread::sleep(REFRESH);
+            match poked.recv_timeout(REFRESH) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => while poked.try_recv().is_ok() {},
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
     });
 }
@@ -101,6 +135,7 @@ enum View {
     List,
     Logs(logs::Logs),
     Commands(commands::Commands),
+    Confirm(Pending),
 }
 
 /// Error lines under a failed lease are fetched once per container run.
@@ -117,9 +152,14 @@ enum Excerpt {
 }
 
 struct App {
+    config: Config,
     host: Host,
     runner: Runner,
     tx: Sender<Msg>,
+    poke: Sender<()>,
+    checkout: Option<Checkout>,
+    /// Actions running or failed, by lease.
+    busy: HashMap<String, Activity>,
     snapshot: Option<Snapshot>,
     error: Option<String>,
     list: list::List,
@@ -128,6 +168,7 @@ struct App {
     /// Tags log lines so lines from a stream you already left are ignored.
     generation: u64,
     body_height: usize,
+    body_width: usize,
     /// Text to hand to the terminal's clipboard after the next draw.
     clipboard: Option<String>,
     notice: Option<&'static str>,
@@ -135,11 +176,21 @@ struct App {
 }
 
 impl App {
-    fn new(host: Host, runner: Runner, tx: Sender<Msg>) -> Self {
+    fn new(
+        config: Config,
+        runner: Runner,
+        tx: Sender<Msg>,
+        poke: Sender<()>,
+        checkout: Option<Checkout>,
+    ) -> Self {
         Self {
-            host,
+            host: config.host.clone(),
+            config,
             runner,
             tx,
+            poke,
+            checkout,
+            busy: HashMap::new(),
             snapshot: None,
             error: None,
             list: list::List::default(),
@@ -147,6 +198,7 @@ impl App {
             excerpts: HashMap::new(),
             generation: 0,
             body_height: 0,
+            body_width: 80,
             clipboard: None,
             notice: None,
             quit: false,
@@ -174,6 +226,22 @@ impl App {
                     };
                     self.excerpts.insert(key, excerpt);
                 }
+                Msg::Progress { lease, line, step } => {
+                    if let Some(activity) = self.busy.get_mut(&lease) {
+                        activity.push(line, step);
+                    }
+                }
+                Msg::Done { lease, result } => match result {
+                    Ok(()) => {
+                        self.busy.remove(&lease);
+                    }
+                    Err(err) => {
+                        if let Some(activity) = self.busy.get_mut(&lease) {
+                            activity.done = true;
+                            activity.error = Some(err);
+                        }
+                    }
+                },
             }
             if self.quit {
                 break;
@@ -206,10 +274,29 @@ impl App {
         }
         let back = matches!(key.code, KeyCode::Esc | KeyCode::Char('q'));
         match &mut self.view {
+            View::Confirm(pending) => match pending.key(key.code) {
+                Answer::Wait => {}
+                Answer::Cancel => self.view = View::List,
+                Answer::Apply => {
+                    let View::Confirm(pending) = std::mem::replace(&mut self.view, View::List)
+                    else {
+                        unreachable!()
+                    };
+                    self.apply(pending);
+                }
+            },
             View::List => match key.code {
                 KeyCode::Char('q') => self.quit = true,
                 KeyCode::Char('l') => self.open_logs(),
                 KeyCode::Char('c') => self.view = View::Commands(commands::Commands::default()),
+                KeyCode::Char(c @ ('u' | 'r' | 's' | 'd' | 'D' | 'm' | 't')) => self.lifecycle(c),
+                KeyCode::Char('R') => self.plan_reap(),
+                KeyCode::Esc => {
+                    // Dismiss a failed action's message.
+                    if let Some(name) = self.selected_lease().map(|l| l.name.clone()) {
+                        self.busy.remove(&name);
+                    }
+                }
                 code => self.list.key(code, self.snapshot.as_ref()),
             },
             // Leaving the logs view drops its stream, which stops `docker logs`.
@@ -227,6 +314,205 @@ impl App {
 
     fn selected_lease(&self) -> Option<&Lease> {
         self.list.selected_lease(self.snapshot.as_ref())
+    }
+
+    /// Which lifecycle keys apply to a lease, in footer order.
+    fn verbs(&self, lease: &Lease) -> Vec<(&'static str, &'static str)> {
+        let mut keys = Vec::new();
+        let live = lease.live_worktree().is_some();
+        let has_backend = lease.container.is_some() || lease.sync.is_some();
+        if lease.group == Group::Orphaned {
+            keys.push(("R", "reap"));
+            if has_backend {
+                keys.push(("d", "down"));
+            }
+            return keys;
+        }
+        if live && !lease.is_running() {
+            keys.push(("u", "up"));
+        }
+        if lease.is_running() || matches!(lease.state, crate::lease::State::CrashLoop { .. }) {
+            keys.push(("r", "restart"));
+            keys.push(("s", "stop"));
+        }
+        let fixes_wiring = self.config.forward == Forward::Mutagen || !self.config.wires.is_empty();
+        if lease.is_running() && live && fixes_wiring {
+            keys.push(("t", "tunnel"));
+        }
+        if live
+            && self
+                .config
+                .database
+                .as_ref()
+                .is_some_and(|db| db.migrate.is_some())
+            && lease.database.is_some()
+        {
+            keys.push(("m", "migrate"));
+        }
+        if has_backend {
+            keys.push(("d", "down"));
+        }
+        if lease.database.is_some() {
+            keys.push(("D", "drop"));
+        }
+        keys
+    }
+
+    fn lifecycle(&mut self, key: char) {
+        let Some(lease) = self.selected_lease().cloned() else {
+            return;
+        };
+        let allowed = self.verbs(&lease).iter().any(|(k, _)| k.starts_with(key));
+        if !allowed || self.busy.get(&lease.name).is_some_and(|a| !a.done) {
+            return;
+        }
+        let name = lease.name.clone();
+        match key {
+            'u' => {
+                let Some(worktree) = lease.live_worktree().map(std::path::PathBuf::from) else {
+                    return;
+                };
+                self.spawn("up", name.clone(), move |ctx| {
+                    ops::up(ctx, &name, &worktree)
+                });
+            }
+            'r' => self.spawn("restart", name.clone(), move |ctx| ops::restart(ctx, &name)),
+            's' => self.spawn("stop", name.clone(), move |ctx| ops::stop(ctx, &name)),
+            'm' => self.spawn("migrate", name.clone(), move |ctx| ops::migrate(ctx, &name)),
+            't' => self.spawn("tunnel", name.clone(), move |ctx| ops::tunnel(ctx, &name)),
+            'd' => {
+                let lines = self.down_plan(&lease);
+                self.view = View::Confirm(Pending::Down { lease: name, lines });
+            }
+            'D' => {
+                let mut lines = self.down_plan(&lease);
+                lines.pop();
+                if let Some(db) = &lease.database {
+                    lines.push(format!("drop the database {}", db.name));
+                }
+                self.view = View::Confirm(Pending::Drop {
+                    lease: name,
+                    lines,
+                    typed: String::new(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// What `down` will remove, in words.
+    fn down_plan(&self, lease: &Lease) -> Vec<String> {
+        let mut lines = Vec::new();
+        if lease.container.is_some() {
+            lines.push(format!(
+                "remove the containers of {}",
+                self.config.project.render(&lease.name)
+            ));
+        }
+        if let Some(forward) = &lease.forward {
+            lines.push(format!("remove the forward {}", forward.session));
+        }
+        if let Some(sync) = &lease.sync {
+            lines.push(format!("remove the sync {} and its replica", sync.session));
+        }
+        if let Some(worktree) = lease.live_worktree() {
+            for w in &self.config.wires {
+                if std::path::Path::new(worktree).join(&w.file).is_file() {
+                    lines.push(format!("remove {}", w.file));
+                }
+            }
+        }
+        match &lease.database {
+            Some(db) => lines.push(format!("keep the database {}", db.name)),
+            None => lines.push(String::new()),
+        }
+        lines
+    }
+
+    fn plan_reap(&mut self) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let plan = ops::reap::plan(snapshot, Timestamp::now());
+        if plan.items.is_empty() {
+            self.notice = Some("no orphans");
+            return;
+        }
+        self.view = View::Confirm(Pending::Reap { plan });
+    }
+
+    fn apply(&mut self, pending: Pending) {
+        match pending {
+            Pending::Down { lease, .. } => {
+                let name = lease.clone();
+                self.spawn("down", lease, move |ctx| ops::down(ctx, &name));
+            }
+            Pending::Drop { lease, .. } => {
+                let name = lease.clone();
+                self.spawn("drop", lease, move |ctx| ops::drop(ctx, &name));
+            }
+            Pending::Reap { plan } => {
+                for item in &plan.items {
+                    if item.action != ops::reap::Action::Keep {
+                        self.busy
+                            .insert(item.lease.name.clone(), Activity::new("reap"));
+                    }
+                }
+                let tx = self.tx.clone();
+                self.spawn_with("reap", "reap".to_string(), move |ctx| {
+                    let failures = ops::reap::apply(ctx, &plan);
+                    for item in &plan.items {
+                        let error = failures
+                            .iter()
+                            .find(|(name, _)| *name == item.lease.name)
+                            .map(|(_, err)| err.clone());
+                        let _ = tx.send(Msg::Done {
+                            lease: item.lease.name.clone(),
+                            result: error.map_or(Ok(()), Err),
+                        });
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+
+    fn spawn(
+        &mut self,
+        verb: &'static str,
+        lease: String,
+        work: impl FnOnce(&Ctx) -> Result<()> + Send + 'static,
+    ) {
+        self.busy.insert(lease.clone(), Activity::new(verb));
+        self.spawn_with(verb, lease, work);
+    }
+
+    /// Runs an action on its own thread; its steps come back as messages.
+    fn spawn_with(
+        &mut self,
+        _verb: &'static str,
+        lease: String,
+        work: impl FnOnce(&Ctx) -> Result<()> + Send + 'static,
+    ) {
+        let config = self.config.clone();
+        let runner = self.runner.clone();
+        let main = self.checkout.as_ref().map(|c| c.main.clone());
+        let (tx, poke) = (self.tx.clone(), self.poke.clone());
+        thread::spawn(move || {
+            let progress = TuiProgress {
+                lease: lease.clone(),
+                tx: tx.clone(),
+            };
+            let ctx = Ctx {
+                config: &config,
+                runner: &runner,
+                out: &progress,
+                main: main.as_deref(),
+            };
+            let result = work(&ctx).map_err(|err| format!("{err:#}"));
+            let _ = tx.send(Msg::Done { lease, result });
+            let _ = poke.send(());
+        });
     }
 
     fn open_logs(&mut self) {
@@ -313,6 +599,7 @@ impl App {
         ])
         .areas(area);
         self.body_height = body.height as usize;
+        self.body_width = body.width as usize;
 
         let clock = Zoned::now().strftime("%H:%M").to_string();
         frame.render_widget(
@@ -346,6 +633,11 @@ impl App {
                     commands::keys(self.notice),
                 )
             }
+            View::Confirm(pending) => (
+                pending.header(self.host.label()),
+                Some(pending.lines()),
+                pending.keys(),
+            ),
         };
         frame.render_widget(Paragraph::new(head), header);
         if let Some(lines) = lines {
@@ -410,6 +702,15 @@ fn key_hints(pairs: &[(&'static str, &'static str)]) -> Line<'static> {
         spans.push(Span::styled(*label, dim()));
     }
     Line::from(spans)
+}
+
+/// How wide `key_hints` renders `pairs`.
+fn hints_width(pairs: &[(&str, &str)]) -> usize {
+    pairs
+        .iter()
+        .map(|(k, l)| view::width(k) + 1 + view::width(l))
+        .sum::<usize>()
+        + GAP.len() * pairs.len().saturating_sub(1)
 }
 
 fn title(text: String) -> Span<'static> {
