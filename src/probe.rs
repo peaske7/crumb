@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::config::{Config, DbServer};
-use crate::run::Runner;
+use crate::config::{Config, DbServer, Runtime};
+use crate::run::{Runner, quote};
 
 const SCRIPT: &str = include_str!("probe.sh");
 
@@ -17,6 +17,10 @@ pub struct HostFacts {
     pub memory: HashMap<String, u64>,
     pub listeners: Vec<u16>,
     pub databases: Vec<DatabaseFact>,
+    /// Database name to the newest applied migration version.
+    pub schema: HashMap<String, String>,
+    /// tmux sessions of process leases.
+    pub sessions: Vec<Session>,
     /// stderr from the host's docker and psql calls, one line each.
     pub warnings: Vec<String>,
 }
@@ -35,6 +39,8 @@ pub struct Container {
     #[serde(default)]
     pub exit_code: i64,
     #[serde(default)]
+    pub oom_killed: bool,
+    #[serde(default)]
     pub started_at: String,
     #[serde(default)]
     pub finished_at: String,
@@ -43,6 +49,10 @@ pub struct Container {
     pub restarts: u64,
     #[serde(default)]
     pub labels: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub mounts: Option<Vec<Mount>>,
     #[serde(default)]
     pub ports: Option<HashMap<String, Option<Vec<Binding>>>>,
     #[serde(default)]
@@ -57,11 +67,63 @@ impl Container {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
+pub struct Mount {
+    #[serde(rename = "Type")]
+    pub kind: String,
+    #[serde(default)]
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct Binding {
     #[serde(default)]
     pub host_ip: String,
     #[serde(default)]
     pub host_port: String,
+}
+
+/// A process lease's tmux session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub name: String,
+    pub created: i64,
+    pub dead: bool,
+    pub exit_status: i64,
+    pub port: Option<u16>,
+    /// Whether the ready URL answered; none without one.
+    pub ready: Option<bool>,
+    pub worktree: Option<String>,
+}
+
+impl Session {
+    fn parse(line: &str) -> Option<Self> {
+        let mut parts = line.splitn(7, ' ');
+        let name = parts.next()?.to_string();
+        let created = parts.next()?.parse().ok()?;
+        let dead = parts.next()? == "1";
+        let exit_status = parts.next()?.parse().unwrap_or(0);
+        let port = parts.next()?.parse().ok().filter(|p| *p != 0);
+        let ready = match parts.next()? {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        };
+        let worktree = parts
+            .next()
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_string);
+        Some(Self {
+            name,
+            created,
+            dead,
+            exit_status,
+            port,
+            ready,
+            worktree,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -88,26 +150,30 @@ fn script(config: &Config) -> String {
     let (docker, url, user, like) = match &config.database {
         Some(db) => {
             let (docker, url) = match &db.server {
-                DbServer::Docker(container) => (container.as_str(), ""),
-                DbServer::Url(url) => ("", url.as_str()),
+                Some(DbServer::Docker(container)) => (container.as_str(), ""),
+                Some(DbServer::Url(url)) => ("", url.as_str()),
+                None => ("", ""),
             };
             (docker, url, db.user.as_str(), db.name.sql_like())
         }
         None => ("", "", "postgres", String::new()),
     };
+    let schema = config.schema.as_ref().map_or("", |s| s.query.as_str());
+    let (runtime, ready) = match &config.runtime {
+        Runtime::Compose { .. } => ("compose", ""),
+        Runtime::Process { ready, .. } => ("process", ready.as_deref().unwrap_or_default()),
+    };
     format!(
-        "PROJECT_PREFIX={}\nDB_DOCKER={}\nDB_URL={}\nDB_USER={}\nDB_LIKE={}\n{SCRIPT}",
+        "PROJECT_PREFIX={}\nDB_DOCKER={}\nDB_URL={}\nDB_USER={}\nDB_LIKE={}\nSCHEMA_QUERY={}\nRUNTIME={}\nREADY={}\n{SCRIPT}",
         quote(config.project.prefix()),
         quote(docker),
         quote(url),
         quote(user),
         quote(&like),
+        quote(schema),
+        quote(runtime),
+        quote(ready),
     )
-}
-
-/// Single-quotes a value for bash.
-fn quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 pub fn parse(output: &str) -> Result<HostFacts> {
@@ -156,6 +222,16 @@ pub fn parse(output: &str) -> Result<HostFacts> {
                 facts.databases = serde_json::from_str(line)
                     .with_context(|| format!("unreadable database list: {line}"))?;
             }
+            "schema" => {
+                if let Some((db, version)) = line.split_once(' ')
+                    && !version.trim().is_empty()
+                {
+                    facts
+                        .schema
+                        .insert(db.to_string(), version.trim().to_string());
+                }
+            }
+            "tmux" => facts.sessions.extend(Session::parse(line)),
             "warnings" => facts.warnings.push(line.to_string()),
             _ => {}
         }
@@ -210,14 +286,36 @@ mod tests {
     }
 
     #[test]
+    fn reads_schema_versions() {
+        let facts = parse(
+            "@@crumb-probe 1\n@@databases\n[]\n@@schema\nwt_a 20260928220000\nwt_b \n@@end\n",
+        )
+        .unwrap();
+        assert_eq!(
+            facts.schema.get("wt_a").map(String::as_str),
+            Some("20260928220000")
+        );
+        assert!(!facts.schema.contains_key("wt_b"));
+    }
+
+    #[test]
+    fn reads_tmux_sessions() {
+        let facts = parse(
+            "@@crumb-probe 1\n@@tmux\napp_a 1790000000 0 0 4101 1 /work/my app\napp_b 1790000000 1 2 4102 - \n@@end\n",
+        )
+        .unwrap();
+        assert_eq!(facts.sessions[0].port, Some(4101));
+        assert_eq!(facts.sessions[0].ready, Some(true));
+        assert_eq!(facts.sessions[0].worktree.as_deref(), Some("/work/my app"));
+        assert!(facts.sessions[1].dead);
+        assert_eq!(facts.sessions[1].exit_status, 2);
+        assert_eq!(facts.sessions[1].ready, None);
+    }
+
+    #[test]
     fn rejects_truncated_output() {
         let truncated = SAMPLE.split("@@databases").next().unwrap();
         assert!(parse(truncated).is_err());
         assert!(parse("").is_err());
-    }
-
-    #[test]
-    fn quotes_values_for_bash() {
-        assert_eq!(quote("it's"), "'it'\\''s'");
     }
 }
