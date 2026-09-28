@@ -7,7 +7,7 @@ use ratatui::crossterm::event::KeyCode;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::{ACCENT, App, Excerpt, GAP, dim, failed, key_hints, title, tone};
+use super::{ACCENT, App, Excerpt, GAP, dim, failed, hints_width, key_hints, title, tone};
 use crate::lease::{Group, Lease};
 use crate::snapshot::Snapshot;
 use crate::view::{self, Tone};
@@ -159,7 +159,13 @@ pub(super) fn body(app: &App) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
     let now = Timestamp::now();
     let rows: Vec<(&Lease, view::Row)> = selectable(Some(snapshot))
         .into_iter()
-        .map(|l| (l, view::row(l, now)))
+        .map(|l| {
+            let mut row = view::row(l, now);
+            if let Some(activity) = app.busy.get(&l.name) {
+                row.status = activity.status();
+            }
+            (l, row)
+        })
         .collect();
     let widths = view::widths(rows.iter().map(|(_, row)| row));
     let mut groups: Vec<Group> = snapshot.leases.iter().map(|l| l.group).collect();
@@ -195,7 +201,8 @@ pub(super) fn body(app: &App) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
             let is_selected = app.list.selected.as_deref() == Some(lease.name.as_str());
             let top = lines.len();
             lines.push(row_line(row, widths, is_selected));
-            if is_selected && app.list.expanded(lease) {
+            let busy = app.busy.contains_key(&lease.name);
+            if is_selected && (app.list.expanded(lease) || busy) {
                 lines.extend(details(app, lease, now));
             }
             if is_selected {
@@ -216,22 +223,56 @@ pub(super) fn body(app: &App) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
 /// The lines under an expanded row: why it needs attention, then the last
 /// error lines from its backend when it has failed.
 fn details(app: &App, lease: &Lease, now: Timestamp) -> Vec<Line<'static>> {
-    let detail = |label: &str, text: String, t: Tone| {
-        Line::from(vec![
-            Span::raw("    "),
-            Span::styled(view::pad(label, 10), dim()),
-            Span::styled(text, tone(t)),
-        ])
+    // Long reasons wrap under their own column rather than off the screen.
+    let columns = app.body_width.saturating_sub(14);
+    let detail = |label: &str, text: String, t: Tone| -> Vec<Line<'static>> {
+        view::wrap(&text, columns)
+            .into_iter()
+            .enumerate()
+            .map(|(index, part)| {
+                let label = if index == 0 { label } else { "" };
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(view::pad(label, 10), dim()),
+                    Span::styled(part, tone(t)),
+                ])
+            })
+            .collect()
     };
-    let mut lines: Vec<Line> = view::reasons(lease, now)
-        .into_iter()
-        .map(|(label, text, t)| detail(label, text, t))
-        .collect();
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(activity) = app.busy.get(&lease.name) {
+        match &activity.error {
+            Some(error) => {
+                for (index, line) in error.lines().enumerate() {
+                    let label = if index == 0 { activity.verb } else { "" };
+                    lines.extend(detail(label, line.trim().to_string(), Tone::Bad));
+                }
+                lines.extend(detail(
+                    "",
+                    "esc dismisses · c shows every command".into(),
+                    Tone::Dim,
+                ));
+            }
+            None => {
+                let recent = activity.lines.len().saturating_sub(3);
+                for (index, line) in activity.lines[recent..].iter().enumerate() {
+                    let label = if index == 0 { activity.verb } else { "" };
+                    lines.extend(detail(label, line.clone(), Tone::Dim));
+                }
+            }
+        }
+        return lines;
+    }
+    lines.extend(
+        view::reasons(lease, now)
+            .into_iter()
+            .flat_map(|(label, text, t)| detail(label, text, t)),
+    );
     if !failed(lease) {
         return lines;
     }
     match app.excerpt_for(lease) {
-        Some(Excerpt::Loading) => lines.push(detail("logs", "reading…".into(), Tone::Dim)),
+        Some(Excerpt::Loading) => lines.extend(detail("logs", "reading…".into(), Tone::Dim)),
         Some(Excerpt::Lines(excerpt)) => {
             for (index, line) in excerpt.iter().enumerate() {
                 let t = if view::is_error_line(line) {
@@ -240,11 +281,11 @@ fn details(app: &App, lease: &Lease, now: Timestamp) -> Vec<Line<'static>> {
                     Tone::Dim
                 };
                 let label = if index == 0 { "logs" } else { "" };
-                lines.push(detail(label, line.clone(), t));
+                lines.extend(detail(label, line.clone(), t));
             }
         }
         Some(Excerpt::Failed(err)) => {
-            lines.push(detail("logs", format!("couldn't read: {err}"), Tone::Dim))
+            lines.extend(detail("logs", format!("couldn't read: {err}"), Tone::Dim));
         }
         None => {}
     }
@@ -258,10 +299,25 @@ pub(super) fn keys(app: &App) -> Line<'static> {
         _ => "details",
     };
     let mut pairs = vec![("↑↓", "move"), ("⏎", details)];
+    if let Some(lease) = lease
+        && !app.busy.get(&lease.name).is_some_and(|a| !a.done)
+    {
+        pairs.extend(app.verbs(lease));
+    }
     if lease.is_some_and(|l| l.container.is_some()) {
         pairs.push(("l", "logs"));
     }
     pairs.extend([("c", "commands"), ("q", "quit")]);
+    if let Some(notice) = app.notice {
+        pairs.push(("·", notice));
+    }
+    // Keys every screen has go first when the footer runs out of room.
+    for key in ["↑↓", "c", "⏎", "q"] {
+        if hints_width(&pairs) <= app.body_width {
+            break;
+        }
+        pairs.retain(|(k, _)| *k != key);
+    }
     key_hints(&pairs)
 }
 
@@ -272,6 +328,9 @@ fn heading(group: Group, members: &[&Lease]) -> Line<'static> {
             if let Some(total) = view::total_memory(members.iter().copied()) {
                 spans.push(Span::styled(format!(" · {}", view::memory(total)), dim()));
             }
+            spans.push(Span::raw(GAP));
+            spans.push(Span::styled("R", Style::new().fg(ACCENT)));
+            spans.push(Span::styled(" reap", dim()));
             Line::from(spans)
         }
         _ => Line::styled(view::group_title(group), dim()),

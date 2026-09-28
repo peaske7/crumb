@@ -17,6 +17,8 @@ pub struct HostFacts {
     pub memory: HashMap<String, u64>,
     pub listeners: Vec<u16>,
     pub databases: Vec<DatabaseFact>,
+    /// Database name to the newest applied migration version.
+    pub schema: HashMap<String, String>,
     /// stderr from the host's docker and psql calls, one line each.
     pub warnings: Vec<String>,
 }
@@ -34,6 +36,8 @@ pub struct Container {
     pub status: String,
     #[serde(default)]
     pub exit_code: i64,
+    #[serde(default)]
+    pub oom_killed: bool,
     #[serde(default)]
     pub started_at: String,
     #[serde(default)]
@@ -101,20 +105,23 @@ fn script(config: &Config) -> String {
     let (docker, url, user, like) = match &config.database {
         Some(db) => {
             let (docker, url) = match &db.server {
-                DbServer::Docker(container) => (container.as_str(), ""),
-                DbServer::Url(url) => ("", url.as_str()),
+                Some(DbServer::Docker(container)) => (container.as_str(), ""),
+                Some(DbServer::Url(url)) => ("", url.as_str()),
+                None => ("", ""),
             };
             (docker, url, db.user.as_str(), db.name.sql_like())
         }
         None => ("", "", "postgres", String::new()),
     };
+    let schema = config.schema.as_ref().map_or("", |s| s.query.as_str());
     format!(
-        "PROJECT_PREFIX={}\nDB_DOCKER={}\nDB_URL={}\nDB_USER={}\nDB_LIKE={}\n{SCRIPT}",
+        "PROJECT_PREFIX={}\nDB_DOCKER={}\nDB_URL={}\nDB_USER={}\nDB_LIKE={}\nSCHEMA_QUERY={}\n{SCRIPT}",
         quote(config.project.prefix()),
         quote(docker),
         quote(url),
         quote(user),
         quote(&like),
+        quote(schema),
     )
 }
 
@@ -163,6 +170,15 @@ pub fn parse(output: &str) -> Result<HostFacts> {
             "databases" => {
                 facts.databases = serde_json::from_str(line)
                     .with_context(|| format!("unreadable database list: {line}"))?;
+            }
+            "schema" => {
+                if let Some((db, version)) = line.split_once(' ')
+                    && !version.trim().is_empty()
+                {
+                    facts
+                        .schema
+                        .insert(db.to_string(), version.trim().to_string());
+                }
             }
             "warnings" => facts.warnings.push(line.to_string()),
             _ => {}
@@ -215,6 +231,19 @@ mod tests {
             Some("wt_lym_1127")
         );
         assert_eq!(looping.health.as_deref(), Some("starting"));
+    }
+
+    #[test]
+    fn reads_schema_versions() {
+        let facts = parse(
+            "@@crumb-probe 1\n@@databases\n[]\n@@schema\nwt_a 20260928220000\nwt_b \n@@end\n",
+        )
+        .unwrap();
+        assert_eq!(
+            facts.schema.get("wt_a").map(String::as_str),
+            Some("20260928220000")
+        );
+        assert!(!facts.schema.contains_key("wt_b"));
     }
 
     #[test]

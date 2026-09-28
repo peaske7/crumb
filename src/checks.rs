@@ -1,5 +1,6 @@
 //! Checks that say a running lease is behind its worktree: files changed
-//! after the backend started, or a lockfile the image doesn't match.
+//! after the backend started, a lockfile the image doesn't match, migrations
+//! the database hasn't applied, or env files that point somewhere else.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -8,8 +9,9 @@ use jiff::{SignedDuration, Timestamp};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::lease::{Lease, Reason, State};
+use crate::lease::{Lease, Reason, State, Wiring};
 use crate::run::{Runner, quote};
+use crate::wire;
 
 /// Directories that never hold source crumb should watch. Dot-directories are
 /// skipped as well.
@@ -101,9 +103,11 @@ fn safe_image_id(id: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == ':')
 }
 
-/// Adds the build and deps reasons to leases whose worktree is on this machine.
+/// Adds the build, deps, schema and wiring reasons to leases whose worktree
+/// is on this machine.
 pub fn apply(config: &Config, images: &Images, leases: &mut [Lease]) {
     for lease in leases.iter_mut() {
+        wiring(config, lease);
         let Some(worktree) = lease
             .worktree
             .as_ref()
@@ -132,7 +136,84 @@ pub fn apply(config: &Config, images: &Images, leases: &mut [Lease]) {
                 lease.reasons.push(Reason::DepsBehind);
             }
         }
+        if let Some(schema) = &config.schema {
+            lease.newest_migration = newest_migration(&worktree.join(&schema.migrations));
+            let applied = lease.database.as_ref().and_then(|d| d.applied.as_deref());
+            if let (Some(newest), Some(applied)) = (&lease.newest_migration, applied)
+                && version_after(newest, applied)
+            {
+                lease.reasons.push(Reason::SchemaBehind);
+            }
+        }
         lease.regroup();
+    }
+}
+
+/// Judges each wired file of a running lease against what it should say.
+fn wiring(config: &Config, lease: &mut Lease) {
+    let Some(worktree) = lease.live_worktree().map(Path::new) else {
+        return;
+    };
+    if !lease.is_running() {
+        return;
+    }
+    let vars = lease.vars(config);
+    let mut found = Vec::new();
+    for w in &config.wires {
+        // A value from a create command's output isn't known here; judge
+        // only that the file is there and names this lease.
+        let knowable = w.set.values().all(|v| vars.missing(v).is_empty());
+        let status = if knowable {
+            wire::judge(worktree, w, &wire::content(w, &lease.name, &vars))
+        } else {
+            match std::fs::read_to_string(worktree.join(&w.file)) {
+                Err(_) => wire::Status::Missing,
+                Ok(text) => match text.lines().find_map(wire::remote_url) {
+                    Some(url) => wire::Status::Remote { url },
+                    None if text.starts_with(&format!("{} {}\n", wire::MARKER, lease.name)) => {
+                        wire::Status::Ok
+                    }
+                    None => wire::Status::Stale,
+                },
+            }
+        };
+        found.push(Wiring {
+            file: w.file.clone(),
+            status,
+        });
+    }
+    if found
+        .iter()
+        .any(|w| matches!(w.status, wire::Status::Remote { .. }))
+    {
+        lease.reasons.push(Reason::WiringRemote);
+    } else if found.iter().any(|w| w.status != wire::Status::Ok) {
+        lease.reasons.push(Reason::WiringStale);
+    }
+    lease.wiring = found;
+}
+
+/// The highest version among files named `<digits>_…` or `<digits>.…`.
+pub fn newest_migration(dir: &Path) -> Option<String> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let digits: String = name.chars().take_while(char::is_ascii_digit).collect();
+            (!digits.is_empty() && digits.len() < name.len()).then_some(digits)
+        })
+        .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+}
+
+/// Whether version `a` comes after `b`. Numeric when both are digits.
+fn version_after(a: &str, b: &str) -> bool {
+    let numeric = |v: &str| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit());
+    if numeric(a) && numeric(b) {
+        let (a, b) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+        a.len() > b.len() || (a.len() == b.len() && a > b)
+    } else {
+        a > b
     }
 }
 
@@ -208,8 +289,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
-    use crate::config::{DepsCheck, Host, Pattern};
-    use crate::lease::{Group, Worktree};
+    use crate::lease::{Database, Group, Worktree};
 
     /// A scratch worktree under the system temp dir, removed on drop.
     struct Scratch(PathBuf);
@@ -308,27 +388,35 @@ mod tests {
     }
 
     fn config() -> Config {
-        Config {
-            host: Host::Local,
-            mutagen: false,
-            label_keys: vec![],
-            project: Pattern::parse("wt_{lease}").unwrap(),
-            service: None,
-            port: None,
-            database: None,
-            deps: Some(DepsCheck {
-                lockfile: "pnpm-lock.yaml".into(),
-                image_path: "/app/pnpm-lock.yaml".into(),
-            }),
-        }
+        Config::parse(
+            r#"
+            [runtime]
+            project = "wt_{lease}"
+            [checks]
+            deps = { lockfile = "pnpm-lock.yaml", image_path = "/app/pnpm-lock.yaml" }
+            schema = { migrations = "db/migrations", query = "select 1" }
+            "#,
+        )
+        .unwrap()
+    }
+
+    fn wired() -> Config {
+        let mut config = config();
+        config.wires = Config::parse(
+            r#"
+            [[wire]]
+            file = "web/.env.development.local"
+            set.API_URL = "http://127.0.0.1:{local_port}"
+            "#,
+        )
+        .unwrap()
+        .wires;
+        config
     }
 
     fn lease(tree: &Scratch, started: Timestamp) -> Lease {
         Lease {
-            name: "a".into(),
-            group: Group::Running,
             state: State::Healthy,
-            reasons: vec![],
             worktree: Some(Worktree {
                 path: tree.0.to_string_lossy().into_owned(),
                 exists: true,
@@ -336,14 +424,8 @@ mod tests {
             container: Some("wt_a-backend-1".into()),
             image: Some("sha256:abc".into()),
             watch: vec!["src".into()],
-            changed_file: None,
-            image_built: None,
-            port: None,
-            memory_bytes: None,
-            restarts: 0,
             since: Some(started),
-            sync: None,
-            database: None,
+            ..Lease::new("a")
         }
     }
 
@@ -397,5 +479,70 @@ mod tests {
             Images::default().missing(&config(), &leases),
             ["sha256:abc"]
         );
+    }
+
+    #[test]
+    fn unapplied_migrations_are_schema_behind() {
+        let tree = Scratch::new("schema");
+        tree.file("db/migrations/20260928140000_a.sql", "", 2 * HOUR);
+        tree.file("db/migrations/20260928220000_b.sql", "", 2 * HOUR);
+        tree.file("db/migrations/atlas.sum", "", 2 * HOUR);
+        let mut leases = [Lease {
+            database: Some(Database {
+                name: "wt_a".into(),
+                comment: None,
+                applied: Some("20260928140000".into()),
+            }),
+            ..lease(&tree, ago(Duration::ZERO) + SKEW * 2)
+        }];
+        apply(&config(), &Images::default(), &mut leases);
+        assert_eq!(
+            leases[0].newest_migration.as_deref(),
+            Some("20260928220000")
+        );
+        assert_eq!(leases[0].reasons, [Reason::SchemaBehind]);
+    }
+
+    #[test]
+    fn wiring_that_points_elsewhere_is_behind() {
+        let tree = Scratch::new("wiring");
+        let base = lease(&tree, ago(Duration::ZERO) + SKEW * 2);
+        let mut leases = [Lease {
+            local_port: Some(18101),
+            ..base.clone()
+        }];
+        apply(&wired(), &Images::default(), &mut leases);
+        assert_eq!(leases[0].reasons, [Reason::WiringStale]);
+
+        tree.file(
+            "web/.env.development.local",
+            "# crumb lease a\nAPI_URL=http://127.0.0.1:18101\n",
+            HOUR,
+        );
+        let mut leases = [Lease {
+            local_port: Some(18101),
+            ..base.clone()
+        }];
+        apply(&wired(), &Images::default(), &mut leases);
+        assert!(leases[0].reasons.is_empty());
+
+        tree.file(
+            "web/.env.development.local",
+            "# old\nAPI_URL=http://100.64.0.1:8101\n",
+            HOUR,
+        );
+        let mut leases = [Lease {
+            local_port: Some(18101),
+            ..base
+        }];
+        apply(&wired(), &Images::default(), &mut leases);
+        assert_eq!(leases[0].reasons, [Reason::WiringRemote]);
+    }
+
+    #[test]
+    fn versions_compare_as_numbers() {
+        assert!(version_after("20260928220000", "20260928140000"));
+        assert!(!version_after("9", "10"));
+        assert!(!version_after("5", "5"));
     }
 }
