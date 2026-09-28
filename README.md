@@ -49,9 +49,11 @@ Planned channels: `mise use -g github:peaske7/crumb`,
 ## Use
 
 ```sh
-crumb            # the TUI
-crumb ls         # the same list as text
-crumb ls --json  # for scripts and agents
+crumb              # the TUI: ↑↓ or j/k to move, ⏎ for details, q to quit
+crumb ls           # the same list as text
+crumb ls --json    # for scripts and agents
+crumb ls -v        # also print every command crumb ran, with timings
+crumb --host ssh://other-box ls
 ```
 
 crumb reads `crumb.toml` from the repository root. A minimal config for a
