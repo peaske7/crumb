@@ -1,7 +1,7 @@
 //! `crumb doctor`: checks each configured piece and says how to fix what
 //! fails.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -37,20 +37,39 @@ fn fail(name: impl Into<String>, detail: impl Into<String>, fix: impl Into<Strin
     }
 }
 
-pub fn run(config: &Config, runner: &Runner, main: Option<&Path>) -> Vec<Check> {
-    let mut checks = Vec::new();
+/// `worktree` is the checkout crumb runs in, `main` the repository's main
+/// checkout.
+pub fn run(
+    config: &Config,
+    runner: &Runner,
+    worktree: Option<&Path>,
+    main: Option<&Path>,
+) -> Vec<Check> {
+    let mut checks = vec![pass("crumb", crate::VERSION)];
     let repo = config.repo.as_deref();
-    checks.push(match repo {
-        Some(repo) => pass(
+    // Where project files are looked up: this worktree first.
+    let roots: Vec<&Path> = [worktree, repo, main].into_iter().flatten().collect();
+    checks.push(match &config.source {
+        Some(source) => pass("config", source.label()),
+        None => fail(
             "config",
-            repo.join(crate::config::PROJECT_FILE).display().to_string(),
+            "no crumb.toml in this worktree, its main checkout or the default branch",
+            "crumb init",
         ),
-        None => fail("config", "no crumb.toml here or above", "crumb init"),
     });
 
     let reachable = host(config, runner, &mut checks);
     if reachable {
-        remote(config, runner, &mut checks);
+        // The source database is measured against the main checkout, which
+        // is usually on the default branch.
+        let migrations = config.schema.as_ref().and_then(|schema| {
+            [main, repo]
+                .into_iter()
+                .flatten()
+                .map(|root| root.join(&schema.migrations))
+                .find(|dir| dir.is_dir())
+        });
+        remote(config, runner, migrations, &mut checks);
     }
     if config.mutagen || config.forward == Forward::Mutagen {
         checks.push(
@@ -75,8 +94,7 @@ pub fn run(config: &Config, runner: &Runner, main: Option<&Path>) -> Vec<Check> 
     if let Ignore::File(file) = &config.ignore
         && config.mutagen
     {
-        let roots = [repo, main];
-        let found = roots.iter().flatten().any(|root| root.join(file).is_file());
+        let found = roots.iter().any(|root| root.join(file).is_file());
         checks.push(if found {
             pass("sync ignore", file.clone())
         } else {
@@ -91,18 +109,17 @@ pub fn run(config: &Config, runner: &Runner, main: Option<&Path>) -> Vec<Check> 
         file: Some(file), ..
     } = &config.runtime
     {
-        let found = [repo, main]
+        let found = roots
             .iter()
-            .flatten()
-            .any(|root| root.join(file).is_file());
-        checks.push(if found {
-            pass("compose file", file.clone())
-        } else {
-            fail(
+            .map(|root| root.join(file))
+            .find(|p| p.is_file());
+        checks.push(match found {
+            None => fail(
                 "compose file",
                 format!("{file} not found"),
                 "set runtime.compose to the compose file's path",
-            )
+            ),
+            Some(path) => compose_file(file, &path, worktree, main),
         });
     }
     let base = agents::base(runner, false);
@@ -129,6 +146,29 @@ pub fn run(config: &Config, runner: &Runner, main: Option<&Path>) -> Vec<Check> 
         });
     }
     checks
+}
+
+/// Whether the compose file can bind the lease's port.
+fn compose_file(file: &str, path: &Path, worktree: Option<&Path>, main: Option<&Path>) -> Check {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let here = worktree.is_some_and(|w| path.starts_with(w));
+    let place = match main {
+        Some(main) if !here && path.starts_with(main) => " (main checkout)",
+        _ => "",
+    };
+    if text.contains("CRUMB_PORT") {
+        return pass("compose file", format!("{file}{place}"));
+    }
+    let fix = if here && worktree != main {
+        "merge the default branch; this branch predates crumb"
+    } else {
+        "publish the service as 127.0.0.1:${CRUMB_PORT}:<port>"
+    };
+    fail(
+        "compose file",
+        format!("{file}{place} doesn't use ${{CRUMB_PORT}}"),
+        fix,
+    )
 }
 
 /// Whether the host answers, timed.
@@ -168,7 +208,7 @@ fn host(config: &Config, runner: &Runner, checks: &mut Vec<Check>) -> bool {
 }
 
 /// Everything checked on the host, in one round trip.
-fn remote(config: &Config, runner: &Runner, checks: &mut Vec<Check>) {
+fn remote(config: &Config, runner: &Runner, migrations: Option<PathBuf>, checks: &mut Vec<Check>) {
     let mut script = String::from(
         "echo \"docker $(docker version --format '{{.Server.Version}}' 2>/dev/null)\"\n\
          echo \"compose $(docker compose version --short 2>/dev/null)\"\n\
@@ -197,6 +237,12 @@ fn remote(config: &Config, runner: &Runner, checks: &mut Vec<Check>) {
             DbServer::Url(url) => format!("psql {} -Atc 'select 1'", quote(url)),
         };
         script.push_str(&format!("echo \"database $({psql} 2>/dev/null)\"\n"));
+    }
+    let source = source_query(config);
+    if let Some(query) = &source {
+        script.push_str(&format!(
+            "echo \"source $({query} 2>/dev/null | head -n 1)\"\n"
+        ));
     }
     let output = match runner.script(&config.host, "doctor.sh", &script) {
         Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -280,6 +326,65 @@ fn remote(config: &Config, runner: &Runner, checks: &mut Vec<Check>) {
             )
         });
     }
+    if source.is_some()
+        && let (Some(dir), Some(schema), Some(from)) = (
+            migrations,
+            &config.schema,
+            config.database.as_ref().and_then(|db| db.from.as_deref()),
+        )
+    {
+        checks.push(source_schema(
+            from,
+            &value("source"),
+            &dir,
+            &schema.migrations,
+        ));
+    }
+}
+
+/// The command that reads the newest applied migration of `database.from`,
+/// when there is one to read.
+fn source_query(config: &Config) -> Option<String> {
+    let schema = config.schema.as_ref()?;
+    let db = config.database.as_ref()?;
+    let from = db.from.as_deref()?;
+    Some(match db.server.as_ref()? {
+        DbServer::Docker(c) => format!(
+            "docker exec {} psql -U {} -d {} -Atc {}",
+            quote(c),
+            quote(&db.user),
+            quote(from),
+            quote(&schema.query)
+        ),
+        DbServer::Url(url) => format!(
+            "psql {} -Atc {}",
+            quote(&crate::ops::db_url(url, from)),
+            quote(&schema.query)
+        ),
+    })
+}
+
+/// How far `database.from` is behind the migrations. Every lease copies it,
+/// so a source that lags starts each new lease behind.
+fn source_schema(from: &str, applied: &str, migrations: &Path, dir: &str) -> Check {
+    if applied.is_empty() {
+        return fail(
+            "source schema",
+            format!("could not read the applied migration of {from}"),
+            "check that checks.schema.query runs in database.from",
+        );
+    }
+    match crate::checks::migrations_after(migrations, applied) {
+        0 => pass("source schema", format!("{from} is current at {applied}")),
+        n => fail(
+            "source schema",
+            format!(
+                "{from} is {n} migration{} behind {dir}; every new lease starts behind",
+                if n == 1 { "" } else { "s" }
+            ),
+            format!("apply the migrations to {from}, or set database.migrate_on_up = true"),
+        ),
+    }
 }
 
 pub fn print(checks: &[Check], color: bool) {
@@ -309,5 +414,65 @@ pub fn print(checks: &[Check], color: bool) {
             paint(&check.detail, "2"),
             fix
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_worktree_compose_file_without_crumb_port_predates_crumb() {
+        let dir = std::env::temp_dir().join(format!("crumb-doctor-{}", std::process::id()));
+        let (main, worktree) = (dir.join("main"), dir.join("wt"));
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join("compose.yml"),
+            "ports: [\"${OLD_PORT:?}:80\"]\n",
+        )
+        .unwrap();
+        std::fs::write(main.join("compose.yml"), "ports: [\"${CRUMB_PORT}:80\"]\n").unwrap();
+        let old = compose_file(
+            "compose.yml",
+            &worktree.join("compose.yml"),
+            Some(&worktree),
+            Some(&main),
+        );
+        let current = compose_file(
+            "compose.yml",
+            &main.join("compose.yml"),
+            Some(&worktree),
+            Some(&main),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!old.ok);
+        assert_eq!(old.detail, "compose.yml doesn't use ${CRUMB_PORT}");
+        assert_eq!(
+            old.fix.as_deref(),
+            Some("merge the default branch; this branch predates crumb")
+        );
+        assert!(current.ok);
+        assert_eq!(current.detail, "compose.yml (main checkout)");
+    }
+
+    #[test]
+    fn a_source_database_behind_the_migrations_fails() {
+        let dir = std::env::temp_dir().join(format!("crumb-source-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["001_a.sql", "002_b.sql", "003_c.sql"] {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        let behind = source_schema("app_dev", "001", &dir, "db/migrations");
+        let current = source_schema("app_dev", "003", &dir, "db/migrations");
+        let unknown = source_schema("app_dev", "", &dir, "db/migrations");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!behind.ok);
+        assert_eq!(
+            behind.detail,
+            "app_dev is 2 migrations behind db/migrations; every new lease starts behind"
+        );
+        assert!(current.ok);
+        assert!(!unknown.ok);
     }
 }

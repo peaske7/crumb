@@ -3,13 +3,14 @@ use std::io::{IsTerminal, Write};
 use anyhow::Result;
 use jiff::Timestamp;
 
+use crate::config::Config;
 use crate::lease::{Group, Lease};
 use crate::snapshot::Snapshot;
 use crate::view::{self, Tone};
 
 const GAP: &str = "   ";
 
-pub fn print(snapshot: &Snapshot, json: bool) -> Result<()> {
+pub fn print(snapshot: &Snapshot, config: &Config, json: bool) -> Result<()> {
     let mut out = std::io::stdout().lock();
     if json {
         serde_json::to_writer_pretty(&mut out, &snapshot.leases)?;
@@ -18,6 +19,9 @@ pub fn print(snapshot: &Snapshot, json: bool) -> Result<()> {
     }
     let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     out.write_all(render(&snapshot.leases, Timestamp::now(), color).as_bytes())?;
+    for fix in snapshot.leases.iter().filter_map(|l| view::fix(l, config)) {
+        eprintln!("fix: {fix}");
+    }
     for warning in &snapshot.warnings {
         eprintln!("warning: {warning}");
     }

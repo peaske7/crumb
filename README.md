@@ -53,6 +53,19 @@ installer attached to each GitHub release, `brew install
 peaske7/tap/crumb` and `cargo binstall crumb-cli`. macOS and Linux, arm64 and
 x64.
 
+To update, use the same method you installed with:
+
+```sh
+mise upgrade github:peaske7/crumb
+brew upgrade peaske7/tap/crumb
+cargo binstall crumb-cli                                   # replaces an older release
+curl -LsSf https://github.com/peaske7/crumb/releases/latest/download/crumb-cli-installer.sh | sh
+cargo install --git https://github.com/peaske7/crumb --locked   # from source
+```
+
+`crumb --version` prints the commit a build came from (`0.1.0 (1a2b3c4)`),
+so you can tell a stale install from a current one.
+
 ## Use
 
 ```sh
@@ -65,6 +78,7 @@ crumb down         # remove it; keeps the database
 crumb drop         # down, then drop the database (asks you to type the name)
 crumb migrate      # apply this worktree's migrations to its database, restart
 crumb tunnel       # recreate the port forward, rewrite the wired env files
+crumb rebuild      # rebuild the image (checks.deps.rebuild), start on it
 crumb logs -f      # follow the backend's log
 crumb reap         # stop orphans now; bring down those stopped seven days
 crumb init         # write a crumb.toml from what the repository contains
@@ -73,14 +87,15 @@ crumb -v <cmd>     # also print every command crumb ran, with timings
 ```
 
 In the TUI: `j`/`k` move, `⏎` details, `u` up, `r` restart, `s` stop,
-`t` tunnel, `m` migrate, `d` down, `D` drop, `R` reap, `l` logs, `c` the
+`t` tunnel, `m` migrate, `b` rebuild, `d` down, `D` drop, `R` reap, `l` logs, `c` the
 command log (`y` copies a command), `q` quit. The footer shows only the keys
 that apply to the selected lease. Down, drop and reap show their plan first.
 
 ## Configure
 
-crumb reads `crumb.toml` from the repository (or its main checkout, for
-branches that predate it; `--config` or `CRUMB_CONFIG` names another), then
+crumb reads `crumb.toml` from the worktree (for branches that predate it,
+from the main checkout, then from the default branch; `--config` or
+`CRUMB_CONFIG` names another), then
 `~/.config/crumb/config.toml` over it for what differs by machine, then
 `CRUMB_HOST` and `--host`. A remote Docker host synced with Mutagen:
 
@@ -114,9 +129,10 @@ from = "app_development"      # copied for each lease; or your own command:
 # create = "./scripts/db create {lease}"
 # drop = "./scripts/db drop {lease}"
 migrate = "DATABASE_URL=postgres://localhost/{database} npm run migrate"
+migrate_on_up = true          # migrate a new lease before its first start
 
 [checks]
-deps = { lockfile = "pnpm-lock.yaml", image_path = "/app/pnpm-lock.yaml" }
+deps = { lockfile = "pnpm-lock.yaml", image_path = "/app/pnpm-lock.yaml", rebuild = "make image" }
 schema = { migrations = "db/migrations", query = "select max(version) from schema_migrations" }
 
 [[wire]]

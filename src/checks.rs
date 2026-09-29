@@ -195,15 +195,35 @@ fn wiring(config: &Config, lease: &mut Lease) {
 
 /// The highest version among files named `<digits>_…` or `<digits>.…`.
 pub fn newest_migration(dir: &Path) -> Option<String> {
-    std::fs::read_dir(dir)
-        .ok()?
+    migration_versions(dir)
+        .into_iter()
+        .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+}
+
+/// How many migration versions in `dir` come after `applied`.
+pub fn migrations_after(dir: &Path, applied: &str) -> usize {
+    let mut newer: Vec<String> = migration_versions(dir)
+        .into_iter()
+        .filter(|v| version_after(v, applied))
+        .collect();
+    // `001_x.up.sql` and `001_x.down.sql` are one migration.
+    newer.sort();
+    newer.dedup();
+    newer.len()
+}
+
+fn migration_versions(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
             let digits: String = name.chars().take_while(char::is_ascii_digit).collect();
             (!digits.is_empty() && digits.len() < name.len()).then_some(digits)
         })
-        .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+        .collect()
 }
 
 /// Whether version `a` comes after `b`. Numeric when both are digits.
@@ -537,6 +557,21 @@ mod tests {
         }];
         apply(&wired(), &Images::default(), &mut leases);
         assert_eq!(leases[0].reasons, [Reason::WiringRemote]);
+    }
+
+    #[test]
+    fn counts_the_migrations_after_the_applied_one() {
+        let tree = Scratch::new("after");
+        tree.file("m/001_a.up.sql", "", HOUR);
+        tree.file("m/001_a.down.sql", "", HOUR);
+        tree.file("m/002_b.up.sql", "", HOUR);
+        tree.file("m/002_b.down.sql", "", HOUR);
+        tree.file("m/010_c.sql", "", HOUR);
+        tree.file("m/atlas.sum", "", HOUR);
+        let dir = tree.0.join("m");
+        assert_eq!(migrations_after(&dir, "1"), 2);
+        assert_eq!(migrations_after(&dir, "010"), 0);
+        assert_eq!(migrations_after(&tree.0.join("missing"), "1"), 0);
     }
 
     #[test]

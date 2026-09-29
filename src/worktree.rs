@@ -32,25 +32,27 @@ impl Checkout {
 
 /// The worktree containing `dir`, if it is in a git repository.
 pub fn find(runner: &Runner, dir: &Path) -> Option<Checkout> {
-    let git = |args: &[&str]| -> Option<String> {
-        let mut argv = vec!["-C".to_string(), dir.to_string_lossy().into_owned()];
-        argv.extend(args.iter().map(|a| a.to_string()));
-        let output = runner
-            .run(format!("git {}", args.join(" ")), "git", &argv, None)
-            .ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-    };
-    let root = PathBuf::from(git(&["rev-parse", "--show-toplevel"])?);
+    let root = PathBuf::from(git(runner, dir, &["rev-parse", "--show-toplevel"])?.trim());
     // The first entry of `git worktree list` is always the main checkout.
-    let main = git(&["worktree", "list", "--porcelain"])?
+    let main = git(runner, dir, &["worktree", "list", "--porcelain"])?
         .lines()
         .find_map(|line| line.strip_prefix("worktree "))
         .map(PathBuf::from)
         .unwrap_or_else(|| root.clone());
     Some(Checkout { root, main })
+}
+
+/// A git command's stdout, run in `dir`, or nothing when it fails.
+pub fn git(runner: &Runner, dir: &Path, args: &[&str]) -> Option<String> {
+    let mut argv = vec!["-C".to_string(), dir.to_string_lossy().into_owned()];
+    argv.extend(args.iter().map(|a| a.to_string()));
+    let output = runner
+        .run(format!("git {}", args.join(" ")), "git", &argv, None)
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Lowercase, with anything outside `[a-z0-9]` turned into `_`.

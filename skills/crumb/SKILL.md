@@ -25,7 +25,7 @@ worktree is gone), `database_only`. `reasons` says why. Soft reasons mean
 | reason | means | fix |
 | --- | --- | --- |
 | `restart_pending` | files the backend mounts changed after it started | `crumb restart` |
-| `deps_behind` | the lockfile differs from the image's; the next start may fail on a missing module | rebuild the image, then `crumb restart` |
+| `deps_behind` | the lockfile differs from the image's; the next start may fail on a missing module | `crumb rebuild` (needs `checks.deps.rebuild`; otherwise rebuild the image yourself, then `crumb up`) |
 | `schema_behind` | the worktree has migrations the lease database lacks | `crumb migrate` |
 | `no_forward` | nothing forwards the port to this machine | `crumb tunnel` |
 | `wiring_stale`, `wiring_remote` | the worktree's env files point at the wrong port, or at a non-loopback host (WebSockets then fail) | `crumb tunnel` |
@@ -44,13 +44,16 @@ crumb stop        # stops it and pauses the sync; keeps everything
 crumb down        # removes containers, forward, sync, replica, env files; keeps the database
 crumb migrate     # applies the worktree's migrations to the lease database, restarts
 crumb tunnel      # recreates the port forward and rewrites the env files
+crumb rebuild     # rebuilds the image from the worktree's lockfile, starts on it
 crumb logs -f     # follows the backend's log
 crumb reap --dry-run   # what reap would do to orphaned leases
 ```
 
 `crumb up` is safe to rerun: each step continues where the last run stopped.
-It prints the URL on this machine when the backend is healthy. Tell the user
-to restart dev servers that read the wired env files.
+It prints the URL on this machine when the backend is healthy, and a
+`Schema  N migrations behind` line when the new database lags the worktree
+(`crumb migrate` fixes it). Tell the user to restart dev servers that read
+the wired env files.
 
 ## Rules
 
