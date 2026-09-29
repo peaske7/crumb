@@ -2,6 +2,7 @@
 
 use jiff::Timestamp;
 
+use crate::config::Config;
 use crate::lease::{Group, Lease, Reason, State};
 use crate::run::Record;
 
@@ -127,8 +128,36 @@ pub fn memory(bytes: u64) -> String {
     }
 }
 
+/// The command that fixes what a running lease's status says it is behind
+/// on, for `crumb ls` to print under the list.
+pub fn fix(lease: &Lease, config: &Config) -> Option<String> {
+    if lease.group != Group::Running {
+        return None;
+    }
+    let reason = BEHIND.iter().find(|r| lease.reasons.contains(r))?;
+    let verb = match reason {
+        Reason::DepsBehind => config
+            .deps
+            .as_ref()
+            .and_then(|d| d.rebuild.as_ref())
+            .map(|_| "rebuild")?,
+        Reason::SchemaBehind => config
+            .database
+            .as_ref()
+            .and_then(|db| db.migrate.as_ref())
+            .map(|_| "migrate")?,
+        Reason::RestartPending => "restart",
+        _ => "tunnel",
+    };
+    Some(format!("crumb {verb} {}", lease.name))
+}
+
 /// Explanations for the expanded row: `(label, text, tone)`.
-pub fn reasons(lease: &Lease, now: Timestamp) -> Vec<(&'static str, String, Tone)> {
+pub fn reasons(
+    lease: &Lease,
+    config: &Config,
+    now: Timestamp,
+) -> Vec<(&'static str, String, Tone)> {
     lease
         .reasons
         .iter()
@@ -206,10 +235,14 @@ pub fn reasons(lease: &Lease, now: Timestamp) -> Vec<(&'static str, String, Tone
                     .image_built
                     .map(|at| format!(", built {} ago", age(at, now)))
                     .unwrap_or_default();
+                let fix = match config.deps.as_ref().and_then(|d| d.rebuild.as_ref()) {
+                    Some(_) => "; b rebuilds",
+                    None => "",
+                };
                 (
                     "deps",
                     format!(
-                        "the lockfile differs from the image's{built}; the next start may fail"
+                        "the lockfile differs from the image's{built}; the next start may fail{fix}"
                     ),
                     Tone::Warn,
                 )
@@ -480,6 +513,34 @@ pub fn fold(records: &[Record]) -> Vec<Folded> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deps_behind_names_rebuild_only_when_it_is_configured() {
+        let lease = Lease {
+            group: Group::Running,
+            state: State::Healthy,
+            reasons: vec![Reason::DepsBehind, Reason::RestartPending],
+            ..Lease::new("a")
+        };
+        let deps = "[checks]\ndeps = { lockfile = \"l\", image_path = \"/l\" }";
+        let bare = Config::parse(deps).unwrap();
+        assert_eq!(fix(&lease, &bare), None);
+        let text = |config: &Config| {
+            reasons(&lease, config, Timestamp::now())
+                .into_iter()
+                .find(|(label, _, _)| *label == "deps")
+                .unwrap()
+                .1
+        };
+        assert!(!text(&bare).contains("b rebuilds"));
+
+        let config = Config::parse(
+            "[checks]\ndeps = { lockfile = \"l\", image_path = \"/l\", rebuild = \"make image\" }",
+        )
+        .unwrap();
+        assert_eq!(fix(&lease, &config).as_deref(), Some("crumb rebuild a"));
+        assert!(text(&config).ends_with("; b rebuilds"));
+    }
 
     #[test]
     fn ages_read_like_a_person_would_say_them() {

@@ -290,7 +290,9 @@ impl App {
                 KeyCode::Char('q') => self.quit = true,
                 KeyCode::Char('l') => self.open_logs(),
                 KeyCode::Char('c') => self.view = View::Commands(commands::Commands::default()),
-                KeyCode::Char(c @ ('u' | 'r' | 's' | 'd' | 'D' | 'm' | 't')) => self.lifecycle(c),
+                KeyCode::Char(c @ ('u' | 'r' | 's' | 'd' | 'D' | 'm' | 't' | 'b')) => {
+                    self.lifecycle(c)
+                }
                 KeyCode::Char('R') => self.plan_reap(),
                 KeyCode::Esc => {
                     // Dismiss a failed action's message.
@@ -350,6 +352,16 @@ impl App {
         {
             keys.push(("m", "migrate"));
         }
+        if live
+            && lease.reasons.contains(&crate::lease::Reason::DepsBehind)
+            && self
+                .config
+                .deps
+                .as_ref()
+                .is_some_and(|deps| deps.rebuild.is_some())
+        {
+            keys.push(("b", "rebuild"));
+        }
         if has_backend {
             keys.push(("d", "down"));
         }
@@ -381,6 +393,7 @@ impl App {
             's' => self.spawn("stop", name.clone(), move |ctx| ops::stop(ctx, &name)),
             'm' => self.spawn("migrate", name.clone(), move |ctx| ops::migrate(ctx, &name)),
             't' => self.spawn("tunnel", name.clone(), move |ctx| ops::tunnel(ctx, &name)),
+            'b' => self.spawn("rebuild", name.clone(), move |ctx| ops::rebuild(ctx, &name)),
             'd' => {
                 let lines = self.down_plan(&lease);
                 self.view = View::Confirm(Pending::Down { lease: name, lines });

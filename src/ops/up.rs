@@ -25,6 +25,7 @@ pub fn up(ctx: &Ctx, lease: &str, worktree: &Path) -> Result<()> {
     if !worktree.is_dir() {
         bail!("{} is not a directory", worktree.display());
     }
+    check_compose(ctx, worktree)?;
     let (facts, existing) = ctx.lease(lease)?;
     if let Some(other) = existing.as_ref().and_then(Lease::live_worktree)
         && Path::new(other) != worktree
@@ -38,6 +39,13 @@ pub fn up(ctx: &Ctx, lease: &str, worktree: &Path) -> Result<()> {
         .set("worktree", worktree.to_string_lossy());
 
     let database = ensure_database(ctx, &facts, lease, worktree, &mut vars)?;
+    // Migrating under a backend that is already running would change its
+    // schema without a restart, so only a lease about to start migrates.
+    let starting = !existing.as_ref().is_some_and(Lease::is_running);
+    let behind = match &database {
+        Some(database) => ensure_schema(ctx, database, worktree, &vars, starting)?,
+        None => 0,
+    };
     if ctx.config.mutagen {
         ensure_sync(ctx, &facts, lease, worktree)?;
     }
@@ -66,7 +74,67 @@ pub fn up(ctx: &Ctx, lease: &str, worktree: &Path) -> Result<()> {
         "Ready",
         &format!("{lease} at {url} in {}", duration(started.elapsed())),
     );
+    if behind > 0 {
+        ctx.out.step(
+            "Schema",
+            &format!("{} behind; run crumb migrate", migrations(behind)),
+        );
+    }
     Ok(())
+}
+
+/// Reads how far the lease database is behind the worktree's migrations,
+/// before the backend starts on it. With `database.migrate_on_up` and a
+/// backend that is not running yet it migrates now, so the backend needs no
+/// second restart; otherwise it returns the count for `up` to report.
+fn ensure_schema(
+    ctx: &Ctx,
+    database: &str,
+    worktree: &Path,
+    vars: &Vars,
+    starting: bool,
+) -> Result<usize> {
+    let (Some(schema), Some(db)) = (&ctx.config.schema, &ctx.config.database) else {
+        return Ok(0);
+    };
+    if db.server.is_none() {
+        return Ok(0);
+    }
+    // A database the query fails on (no migrations table yet) or that has
+    // applied nothing reads as unknown, as it does in `crumb ls`.
+    let applied = match psql(ctx, database, &schema.query) {
+        Ok(out) => out.lines().next().unwrap_or_default().trim().to_string(),
+        Err(_) => String::new(),
+    };
+    if applied.is_empty() {
+        ctx.out.detail(&format!(
+            "could not read the applied migration of {database}"
+        ));
+        return Ok(0);
+    }
+    let behind = crate::checks::migrations_after(&worktree.join(&schema.migrations), &applied);
+    if behind == 0 {
+        return Ok(0);
+    }
+    let Some(migrate) = db
+        .migrate
+        .as_deref()
+        .filter(|_| db.migrate_on_up && starting)
+    else {
+        return Ok(behind);
+    };
+    ctx.out.step(
+        "Migrating",
+        &format!("{database}: {} behind", migrations(behind)),
+    );
+    run_command(ctx, "database.migrate", migrate, vars, worktree, "database")?;
+    ctx.out.step("Migrated", database);
+    Ok(0)
+}
+
+/// `1 migration`, `3 migrations`.
+fn migrations(n: usize) -> String {
+    format!("{n} migration{}", if n == 1 { "" } else { "s" })
 }
 
 /// Creates the lease database unless the server already lists it, and labels
@@ -396,6 +464,33 @@ fn labels(
     text
 }
 
+/// Refuses, before anything changes, a compose file that can't bind the
+/// lease's port. A worktree whose branch predates crumb still has the
+/// project's old compose file, which compose would reject only after the
+/// database and sync exist.
+fn check_compose(ctx: &Ctx, worktree: &Path) -> Result<()> {
+    let Runtime::Compose {
+        file: Some(file), ..
+    } = &ctx.config.runtime
+    else {
+        return Ok(());
+    };
+    let source = find_file(worktree, ctx.main, file)?;
+    let text = std::fs::read_to_string(&source)
+        .with_context(|| format!("reading {}", source.display()))?;
+    if text.contains("CRUMB_PORT") {
+        return Ok(());
+    }
+    if source.starts_with(worktree) {
+        bail!(
+            "`{file}` in this worktree doesn't use `${{CRUMB_PORT}}`; the branch predates crumb. Merge the default branch, then rerun `crumb up`."
+        );
+    }
+    bail!(
+        "`{file}` doesn't use `${{CRUMB_PORT}}`; publish the service as `127.0.0.1:${{CRUMB_PORT}}:<port>`"
+    );
+}
+
 /// The file in the worktree, else in the main checkout (for branches that
 /// predate it).
 fn find_file(worktree: &Path, main: Option<&Path>, file: &str) -> Result<PathBuf> {
@@ -464,13 +559,44 @@ mod tests {
         ));
     }
 
+    struct Quiet;
+
+    impl crate::ops::Progress for Quiet {
+        fn step(&self, _: &str, _: &str) {}
+        fn detail(&self, _: &str) {}
+    }
+
+    #[test]
+    fn a_compose_file_without_crumb_port_stops_up_before_anything_runs() {
+        let worktree = std::env::temp_dir().join(format!("crumb-predates-{}", std::process::id()));
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join("compose.yml"),
+            "services:\n  api:\n    ports: [\"127.0.0.1:${OLD_PORT:?}:8080\"]\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::parse(
+            "[runtime]\ncompose = \"compose.yml\"\nservice = \"api\"\n[database]\nserver = \"docker://db\"",
+        )
+        .unwrap();
+        let runner = crate::run::Runner::default();
+        let ctx = Ctx {
+            config: &config,
+            runner: &runner,
+            out: &Quiet,
+            main: None,
+        };
+        let err = up(&ctx, "a", &worktree).unwrap_err().to_string();
+        let _ = std::fs::remove_dir_all(&worktree);
+        assert_eq!(
+            err,
+            "`compose.yml` in this worktree doesn't use `${CRUMB_PORT}`; the branch predates crumb. Merge the default branch, then rerun `crumb up`."
+        );
+        assert!(runner.records().is_empty(), "no command may run first");
+    }
+
     #[test]
     fn refuses_a_database_another_backend_runs_on() {
-        struct Quiet;
-        impl crate::ops::Progress for Quiet {
-            fn step(&self, _: &str, _: &str) {}
-            fn detail(&self, _: &str) {}
-        }
         let config = crate::config::Config::parse(
             "[runtime]\nproject = \"wt_{lease}\"\n[database]\nname = \"wt_{lease}\"\nserver = \"docker://db\"",
         )

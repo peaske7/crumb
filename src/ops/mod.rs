@@ -23,7 +23,7 @@ use crate::view;
 use crate::wire;
 
 pub use up::up;
-pub use verbs::{down, drop, migrate, restart, stop, tunnel};
+pub use verbs::{down, drop, migrate, rebuild, restart, stop, tunnel};
 
 /// Where an operation reports what it is doing.
 pub trait Progress: Sync {
@@ -554,7 +554,7 @@ fn psql(ctx: &Ctx, database: &str, sql: &str) -> Result<String> {
 }
 
 /// The server URL pointed at another database.
-fn db_url(url: &str, database: &str) -> String {
+pub fn db_url(url: &str, database: &str) -> String {
     let (base, params) = match url.split_once('?') {
         Some((base, params)) => (base, format!("?{params}")),
         None => (url, String::new()),

@@ -28,9 +28,12 @@ use crate::run::Runner;
 use crate::snapshot::Here;
 use crate::worktree::Checkout;
 
+/// This build: `0.1.0 (1a2b3c4)`, with `-dirty` for uncommitted changes.
+pub const VERSION: &str = env!("CRUMB_VERSION");
+
 /// A fast, minimal TUI and CLI for per-worktree development backends.
 #[derive(Parser)]
-#[command(name = "crumb", version)]
+#[command(name = "crumb", version = VERSION)]
 struct Cli {
     /// Read this file instead of the nearest crumb.toml.
     #[arg(long, global = true, value_name = "PATH", env = "CRUMB_CONFIG")]
@@ -86,6 +89,8 @@ enum Command {
     Migrate { name: Option<String> },
     /// Recreate the port forward and rewrite the wired env files.
     Tunnel { name: Option<String> },
+    /// Rebuild the image with checks.deps.rebuild, then start the lease on it.
+    Rebuild { name: Option<String> },
     /// Stop orphaned leases; bring down those stopped for seven days.
     Reap {
         /// Apply without asking.
@@ -181,14 +186,20 @@ fn run(cli: Cli, runner: &Runner) -> Result<()> {
     }
     let checkout = worktree::find(runner, &std::env::current_dir()?);
     let config = config::load(
+        runner,
         cli.config.as_deref(),
         cli.host.as_deref(),
         checkout.as_ref().map(|c| c.main.as_path()),
     )?;
     if config.repo.is_none() && !matches!(cli.command, Some(Command::Doctor { .. })) {
         bail!(
-            "no crumb.toml in this repository or its main checkout; `crumb init` writes one, or pass --config"
+            "no crumb.toml in this worktree, its main checkout or the default branch; `crumb init` writes one, or pass --config"
         );
+    }
+    if cli.verbose
+        && let Some(source) = &config.source
+    {
+        eprintln!("crumb: config from {}", source.label());
     }
     let here = checkout.as_ref().filter(|c| !c.is_main()).map(|c| Here {
         lease: c.lease(),
@@ -207,7 +218,7 @@ fn run(cli: Cli, runner: &Runner) -> Result<()> {
     match command {
         Command::Ls { json } => {
             let snapshot = snapshot::collect(&config, runner, here.as_ref())?;
-            ls::print(&snapshot, json)
+            ls::print(&snapshot, &config, json)
         }
         Command::Up { name, path } => {
             let checkout = match path {
@@ -256,13 +267,19 @@ fn run(cli: Cli, runner: &Runner) -> Result<()> {
         }
         Command::Migrate { name } => ops::migrate(&ctx, &name_or_here(&ctx, name, &checkout)?),
         Command::Tunnel { name } => ops::tunnel(&ctx, &name_or_here(&ctx, name, &checkout)?),
+        Command::Rebuild { name } => ops::rebuild(&ctx, &name_or_here(&ctx, name, &checkout)?),
         Command::Reap { yes, dry_run } => reap(&ctx, yes, dry_run),
         Command::Logs { name, follow, tail } => {
             let name = name_or_here(&ctx, name, &checkout)?;
             logs(&ctx, &name, follow, tail)
         }
         Command::Doctor { json } => {
-            let checks = doctor::run(&config, runner, ctx.main);
+            let checks = doctor::run(
+                &config,
+                runner,
+                checkout.as_ref().map(|c| c.root.as_path()),
+                ctx.main,
+            );
             if json {
                 println!("{}", serde_json::to_string_pretty(&checks)?);
             } else {
@@ -294,12 +311,13 @@ fn init(runner: &Runner, yes: bool, force: bool) -> Result<()> {
     let answers = init::ask(&detected, &repo, yes)?;
     std::fs::write(&path, init::render(&detected, &answers))?;
     eprintln!("wrote {}", path.display());
-    let config = config::load(Some(&path), None, None)?;
+    let config = config::load(runner, Some(&path), None, None)?;
     let runner = Runner::default();
     let checkout = worktree::find(&runner, &repo);
     let checks = doctor::run(
         &config,
         &runner,
+        checkout.as_ref().map(|c| c.root.as_path()),
         checkout.as_ref().map(|c| c.main.as_path()),
     );
     doctor::print(

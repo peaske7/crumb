@@ -8,10 +8,12 @@ use super::{
     Ctx, ensure_forward, psql, replica, run_command, shell_path, sql_ident, state_root, unwire,
     wait_healthy, wait_ready, wait_sync, wire_all,
 };
+use crate::checks::Images;
 use crate::config::{Forward, Host, Runtime};
 use crate::lease::Lease;
 use crate::mutagen;
 use crate::run::{duration, quote};
+use crate::snapshot;
 use crate::worktree::check_name;
 
 /// Waits for the sync to land, restarts the backend and waits for health.
@@ -263,6 +265,68 @@ pub fn migrate(ctx: &Ctx, name: &str) -> Result<()> {
         restart(ctx, name)?;
     }
     Ok(())
+}
+
+/// Runs `checks.deps.rebuild` from the lease's worktree once its sync has
+/// landed, then starts the lease on the new image. `docker restart` would
+/// keep the old one, so a compose lease goes through `up`, which recreates
+/// containers whose image changed.
+pub fn rebuild(ctx: &Ctx, name: &str) -> Result<()> {
+    let command = ctx
+        .config
+        .deps
+        .as_ref()
+        .and_then(|deps| deps.rebuild.as_deref())
+        .context("checks.deps.rebuild is not set")?;
+    let facts = snapshot::gather(ctx.config, ctx.runner)?;
+    let leases = snapshot::assemble(ctx.config, &facts, &Images::default(), None).leases;
+    let lease = leases
+        .iter()
+        .find(|l| l.name == name)
+        .with_context(|| format!("no lease named {name} on {}", ctx.config.host.label()))?;
+    let worktree = lease
+        .live_worktree()
+        .context("the rebuild runs in the lease's worktree, which is gone")?
+        .to_string();
+    // Leases that share the image keep running the old build until their
+    // own containers are recreated.
+    if let Some(image) = &lease.image {
+        let others: Vec<&str> = leases
+            .iter()
+            .filter(|l| l.name != name && l.image.as_ref() == Some(image))
+            .map(|l| l.name.as_str())
+            .collect();
+        if !others.is_empty() {
+            ctx.out.detail(&format!(
+                "{} also run this image; `crumb up` there moves them to the new build",
+                others.join(", ")
+            ));
+        }
+    }
+    if let Some(sync) = &lease.sync {
+        if sync.paused {
+            mutagen::run(
+                ctx.runner,
+                &["sync".into(), "resume".into(), sync.session.clone()],
+            )?;
+        }
+        wait_sync(ctx, &sync.session)?;
+    }
+    ctx.out.step("Rebuilding", &format!("the image for {name}"));
+    run_command(
+        ctx,
+        "checks.deps.rebuild",
+        command,
+        &lease.vars(ctx.config),
+        Path::new(&worktree),
+        "deps",
+    )?;
+    ctx.out.step("Rebuilt", &format!("the image for {name}"));
+    match &ctx.config.runtime {
+        Runtime::Compose { .. } => super::up(ctx, name, Path::new(&worktree)),
+        Runtime::Process { .. } if lease.is_running() => restart(ctx, name),
+        Runtime::Process { .. } => Ok(()),
+    }
 }
 
 /// Recreates the forward and rewrites the wired files.

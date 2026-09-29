@@ -264,7 +264,7 @@ fn details(app: &App, lease: &Lease, now: Timestamp) -> Vec<Line<'static>> {
         return lines;
     }
     lines.extend(
-        view::reasons(lease, now)
+        view::reasons(lease, &app.config, now)
             .into_iter()
             .flat_map(|(label, text, t)| detail(label, text, t)),
     );

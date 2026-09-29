@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::run::Runner;
+use crate::worktree::git;
+
 /// Where lease backends run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Host {
@@ -168,8 +171,34 @@ pub struct Config {
     pub deps: Option<DepsCheck>,
     pub schema: Option<SchemaCheck>,
     pub wires: Vec<Wire>,
-    /// The repository whose crumb.toml was read.
+    /// The checkout relative paths resolve against: the worktree whose
+    /// crumb.toml was read, else the main checkout.
     pub repo: Option<PathBuf>,
+    /// Where the project config came from.
+    pub source: Option<Source>,
+}
+
+/// Where the project's crumb.toml was read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// The worktree's own file, or the one `--config` names.
+    File(PathBuf),
+    /// The main checkout's file, for a worktree whose branch predates it.
+    Main(PathBuf),
+    /// The file on the default branch, such as `origin/main`, for when the
+    /// main checkout has a branch without it checked out.
+    Branch(String),
+}
+
+impl Source {
+    /// `/repo/crumb.toml`, `… (main checkout)` or `origin/main:crumb.toml`.
+    pub fn label(&self) -> String {
+        match self {
+            Source::File(path) => path.display().to_string(),
+            Source::Main(path) => format!("{} (main checkout)", path.display()),
+            Source::Branch(rev) => format!("{rev}:{PROJECT_FILE}"),
+        }
+    }
 }
 
 impl Config {
@@ -179,7 +208,7 @@ impl Config {
         let raw: Raw = table
             .try_into()
             .context("crumb.toml does not match the expected shape")?;
-        resolve(raw, None)
+        resolve(raw, None, None)
     }
 
     /// The Mutagen session for a lease: `wt_{lease}` becomes `wt-lym-1119`.
@@ -211,6 +240,9 @@ pub struct DepsCheck {
     pub lockfile: String,
     /// Inside the image, such as `/app/pnpm-lock.yaml`.
     pub image_path: String,
+    /// Rebuilds the image from the worktree's lockfile, per the command
+    /// contract; `crumb rebuild` runs it and starts the lease on the result.
+    pub rebuild: Option<String>,
 }
 
 /// Compare the newest migration in the worktree with the newest one applied.
@@ -232,6 +264,9 @@ pub struct Database {
     pub create: Option<String>,
     pub drop: Option<String>,
     pub migrate: Option<String>,
+    /// Apply migrations during `up`, before the first start, when the new
+    /// database is behind the worktree.
+    pub migrate_on_up: bool,
     /// The built-in driver copies this database when there is no create command.
     pub from: Option<String>,
 }
@@ -278,6 +313,7 @@ struct RawChecks {
 struct RawDeps {
     lockfile: String,
     image_path: String,
+    rebuild: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,6 +372,7 @@ struct RawDatabase {
     create: Option<String>,
     drop: Option<String>,
     migrate: Option<String>,
+    migrate_on_up: Option<bool>,
     from: Option<String>,
 }
 
@@ -354,28 +391,37 @@ pub const PROJECT_FILE: &str = "crumb.toml";
 /// Loads the project's `crumb.toml`, then `~/.config/crumb/config.toml` over
 /// it, then `CRUMB_HOST` and the `--host` flag over both. The user config
 /// holds what differs by machine, such as the host. A worktree whose branch
-/// predates crumb.toml uses the main checkout's.
+/// predates crumb.toml uses the main checkout's, else the default branch's.
 pub fn load(
+    runner: &Runner,
+    explicit: Option<&Path>,
+    host_flag: Option<&str>,
+    main: Option<&Path>,
+) -> Result<Config> {
+    load_from(runner, &std::env::current_dir()?, explicit, host_flag, main)
+}
+
+fn load_from(
+    runner: &Runner,
+    cwd: &Path,
     explicit: Option<&Path>,
     host_flag: Option<&str>,
     main: Option<&Path>,
 ) -> Result<Config> {
     let mut table = toml::Table::new();
-    let source = match explicit {
-        Some(path) => Some(path.to_path_buf()),
-        None => find_project_config(&std::env::current_dir()?).or_else(|| {
-            main.map(|m| m.join(PROJECT_FILE))
-                .filter(|path| path.is_file())
-        }),
+    let found = match explicit {
+        Some(path) => Some((Source::File(path.to_path_buf()), read_table(path)?)),
+        None => find_project(runner, cwd, main)?,
     };
-    if let Some(path) = &source {
-        merge(&mut table, read_table(path)?);
-    }
+    let source = found.map(|(source, project)| {
+        merge(&mut table, project);
+        source
+    });
     if let Some(user) = user_config_path().filter(|p| p.is_file()) {
         merge(&mut table, read_table(&user)?);
     }
     let mut raw: Raw = table.try_into().with_context(|| match &source {
-        Some(path) => format!("{} does not match the expected shape", path.display()),
+        Some(source) => format!("{} does not match the expected shape", source.label()),
         None => "the config does not match the expected shape".to_string(),
     })?;
     if let Some(host) = host_flag
@@ -384,14 +430,62 @@ pub fn load(
     {
         raw.host = Some(host);
     }
-    let repo = source
-        .as_deref()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf);
-    resolve(raw, repo)
+    let repo = match &source {
+        Some(Source::File(path) | Source::Main(path)) => path.parent().map(Path::to_path_buf),
+        Some(Source::Branch(_)) => main.map(Path::to_path_buf),
+        None => None,
+    };
+    resolve(raw, repo, source)
 }
 
-fn resolve(raw: Raw, repo: Option<PathBuf>) -> Result<Config> {
+/// The worktree's crumb.toml, else the main checkout's, else the one on the
+/// default branch.
+fn find_project(
+    runner: &Runner,
+    cwd: &Path,
+    main: Option<&Path>,
+) -> Result<Option<(Source, toml::Table)>> {
+    if let Some(path) = find_project_config(cwd) {
+        let table = read_table(&path)?;
+        return Ok(Some((Source::File(path), table)));
+    }
+    let Some(main) = main else {
+        return Ok(None);
+    };
+    let path = main.join(PROJECT_FILE);
+    if path.is_file() {
+        let table = read_table(&path)?;
+        return Ok(Some((Source::Main(path), table)));
+    }
+    let rev = default_branch(runner, main);
+    let Some(text) = git(runner, main, &["show", &format!("{rev}:{PROJECT_FILE}")]) else {
+        return Ok(None);
+    };
+    let source = Source::Branch(rev);
+    let table = text
+        .parse::<toml::Table>()
+        .with_context(|| format!("parsing {}", source.label()))?;
+    Ok(Some((source, table)))
+}
+
+/// `origin/main`, from `origin/HEAD`; `main` when there is no such remote head.
+fn default_branch(runner: &Runner, repo: &Path) -> String {
+    git(
+        runner,
+        repo,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )
+    .map(|name| name.trim().to_string())
+    .filter(|name| !name.is_empty())
+    .unwrap_or_else(|| "main".to_string())
+}
+
+fn resolve(raw: Raw, repo: Option<PathBuf>, source: Option<Source>) -> Result<Config> {
     let host = Host::parse(raw.host.as_deref().unwrap_or("local"))?;
     let mutagen = match raw.code.sync.as_deref() {
         None | Some("none") => false,
@@ -410,6 +504,7 @@ fn resolve(raw: Raw, repo: Option<PathBuf>) -> Result<Config> {
                 user: db.user.unwrap_or_else(|| "postgres".to_string()),
                 create: db.create,
                 drop: db.drop,
+                migrate_on_up: db.migrate_on_up.unwrap_or(false),
                 migrate: db.migrate,
                 from: db.from,
             })
@@ -421,6 +516,12 @@ fn resolve(raw: Raw, repo: Option<PathBuf>) -> Result<Config> {
         && db.server.is_none()
     {
         bail!("database.from copies a database on database.server; set the server too");
+    }
+    if let Some(db) = &database
+        && db.migrate_on_up
+        && db.migrate.is_none()
+    {
+        bail!("database.migrate_on_up runs database.migrate; set it too");
     }
     if let Some(subnet) = &raw.runtime.subnet {
         if raw.runtime.start.is_some() {
@@ -482,6 +583,7 @@ fn resolve(raw: Raw, repo: Option<PathBuf>) -> Result<Config> {
         deps: raw.checks.deps.map(|deps| DepsCheck {
             lockfile: deps.lockfile,
             image_path: deps.image_path,
+            rebuild: deps.rebuild,
         }),
         schema: raw.checks.schema.map(|schema| SchemaCheck {
             migrations: schema.migrations,
@@ -498,6 +600,7 @@ fn resolve(raw: Raw, repo: Option<PathBuf>) -> Result<Config> {
             })
             .collect(),
         repo,
+        source,
         host,
     })
 }
@@ -652,6 +755,67 @@ mod tests {
         ));
         assert!(Config::parse("[runtime]\nsubnet = \"172.16.5.0/24\"").is_err());
         assert!(Config::parse("[runtime]\nstart = \"x\"\nsubnet = \"172.16.{n}.0/24\"").is_err());
+    }
+
+    #[test]
+    fn a_worktree_that_predates_crumb_reads_the_default_branch() {
+        let dir = std::env::temp_dir().join(format!("crumb-branch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = dir.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let runner = Runner::default();
+        let git = |args: &[&str]| {
+            let mut all = vec![
+                "-c",
+                "user.name=crumb",
+                "-c",
+                "user.email=crumb@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ];
+            all.extend(args);
+            git(&runner, &main, &all).unwrap_or_else(|| panic!("git {args:?} failed"))
+        };
+        let (origin, worktree) = (dir.join("origin.git"), dir.join("wt"));
+        let (origin, worktree) = (origin.to_str().unwrap(), worktree.to_str().unwrap());
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "before crumb"]);
+        git(&["branch", "old"]);
+        std::fs::write(main.join(PROJECT_FILE), "[runtime]\nservice = \"api\"\n").unwrap();
+        git(&["add", PROJECT_FILE]);
+        git(&["commit", "-q", "-m", "adopt crumb"]);
+        git(&["clone", "-q", "--bare", ".", origin]);
+        git(&["remote", "add", "origin", origin]);
+        git(&["fetch", "-q", "origin"]);
+        git(&["remote", "set-head", "origin", "main"]);
+        git(&["worktree", "add", "-q", worktree, "old"]);
+        // The main checkout moves to a commit without crumb.toml.
+        git(&["switch", "-q", "--detach", "HEAD~1"]);
+
+        let config = load_from(
+            &runner,
+            Path::new(worktree),
+            None,
+            None,
+            Some(main.as_path()),
+        )
+        .unwrap();
+        let source = config.source.unwrap();
+        assert_eq!(source, Source::Branch("origin/main".into()));
+        assert_eq!(source.label(), "origin/main:crumb.toml");
+        assert_eq!(config.repo.as_deref(), Some(main.as_path()));
+        assert_eq!(config.service.as_deref(), Some("api"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrating_on_up_needs_a_migrate_command() {
+        assert!(Config::parse("[database]\nmigrate_on_up = true").is_err());
+        let config =
+            Config::parse("[database]\nmigrate = \"make migrate\"\nmigrate_on_up = true").unwrap();
+        assert!(config.database.unwrap().migrate_on_up);
     }
 
     #[test]

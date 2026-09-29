@@ -105,7 +105,12 @@ set.DATABASE_URL = "{database.url}"
 
 ### Config files
 
-- `crumb.toml` at the repo root, committed, describes the project.
+- `crumb.toml` at the repo root, committed, describes the project. A
+  worktree whose branch predates it falls back to the main checkout's file,
+  then to `git show <default branch>:crumb.toml` (the default branch is
+  `origin/HEAD`, else `main`), so the main checkout can be on any branch.
+  Relative paths then resolve against the main checkout. `doctor` and
+  `crumb -v` name the source.
 - `~/.config/crumb/config.toml` holds machine-specific values such as the SSH
   host, so teammates share one project config.
 - Precedence: flags, then `CRUMB_*` environment variables, then the user
@@ -168,6 +173,10 @@ port.
   service through a second, generated compose file, so the project's file
   needs only `127.0.0.1:${CRUMB_PORT}:<port>` and may use `${CRUMB_DATABASE}`
   and `${CRUMB_LEASE}`.
+- `up` reads the compose file before it changes anything. One that doesn't
+  mention `CRUMB_PORT` comes from a branch that predates crumb, and compose
+  would reject it only after the database and sync exist, so `up` stops and
+  says to merge the default branch.
 - Health is Docker's health check; a service without one counts as ready
   after three seconds running. `up` fails fast, with the log's error lines,
   when the container exits or restarts while it waits.
@@ -184,7 +193,11 @@ port.
 - Recommended restart policy: `on-failure:5`. It caps crash loops, and leases
   stay stopped after a host reboot instead of all starting at once.
 - Dependency drift: the SHA-256 of the lockfile inside the image (computed
-  once per image id) against the worktree's lockfile.
+  once per image id) against the worktree's lockfile. `checks.deps.rebuild`
+  is the project's command that rebuilds the image (command contract);
+  `crumb rebuild` waits for the sync, runs it and then runs `up`, because
+  `docker restart` keeps the old image. It lists the other leases on the same
+  image first: they keep the old build until their own `up`.
 - Restart pending: a file changed after the container started, under the
   paths it bind-mounts from its project directory. Only those paths reach
   the running backend, so other edits in the worktree don't count.
@@ -229,7 +242,13 @@ a fresh connection costs about a second and is paid once.
 - One backend per database, checked before every start: two backends on one
   database take each other's queued jobs.
 - Schema freshness: newest migration in the worktree against newest applied
-  revision in the database.
+  revision in the database. `up` reads it before the first start, so a copy
+  of a lagging source says `Schema  N migrations behind; run crumb migrate`
+  next to `Ready`. With `database.migrate_on_up = true` it runs
+  `database.migrate` there instead (before the port is known), so the
+  backend starts current without a second restart. `doctor` measures
+  `database.from` against the main checkout's migrations, since a lagging
+  source starts every lease behind.
 - Dropping takes an explicit key and typing the lease name.
 
 ## Lifecycle
@@ -251,6 +270,7 @@ States are derived from each snapshot:
 | R   | reap    | orphans: stop now; down after seven days stopped                     | the database   |
 | m   | migrate | apply migrations to the lease database, restart                      | everything     |
 | t   | tunnel  | recreate the forward and rewrite wiring                              | everything     |
+| b   | rebuild | wait for sync, run `checks.deps.rebuild`, then `up`                  | everything     |
 
 `up` is idempotent: each step ensures its piece exists, so rerunning after a
 failure continues rather than duplicating. The seven-day grace clock is
@@ -293,6 +313,9 @@ Orca environment recipes and Conductor scripts use the same shape.
   peaske7/tap/crumb`, the shell installer from the GitHub release, or `cargo
   binstall crumb-cli` (the crates.io name `crumb` is taken). One release
   built by `dist`, macOS and Linux, arm64 and x64.
+- `crumb --version` includes the commit it was built from, with `-dirty` for
+  uncommitted changes, and `doctor` reports it, so a bug report says which
+  code it came from.
 - `crumb init` detects the compose file, Mutagen config, SSH hosts,
   migrations and env files, asks at most three questions with the detected
   answer preselected, and writes a commented `crumb.toml`.
