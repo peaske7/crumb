@@ -113,6 +113,9 @@ pub enum Runtime {
         env_file: Option<String>,
         /// Extra arguments for `docker compose up -d`.
         up_args: Vec<String>,
+        /// The subnet of the project's default network, with `{n}` for the
+        /// lease's number, so leases never draw from Docker's address pool.
+        subnet: Option<String>,
     },
     /// A command in a tmux session named after the lease.
     Process {
@@ -309,6 +312,7 @@ struct RawRuntime {
     port: Option<u16>,
     env_file: Option<String>,
     up_args: Option<Vec<String>>,
+    subnet: Option<String>,
     start: Option<String>,
     ready: Option<String>,
     memory_mb: Option<u64>,
@@ -418,6 +422,14 @@ fn resolve(raw: Raw, repo: Option<PathBuf>) -> Result<Config> {
     {
         bail!("database.from copies a database on database.server; set the server too");
     }
+    if let Some(subnet) = &raw.runtime.subnet {
+        if raw.runtime.start.is_some() {
+            bail!("runtime.subnet sets a compose network; a start command has none");
+        }
+        if !subnet.contains("{n}") {
+            bail!("runtime.subnet needs {{n}}, or every lease gets the same network: {subnet:?}");
+        }
+    }
     let runtime = match raw.runtime.start {
         Some(start) => Runtime::Process {
             start,
@@ -427,6 +439,7 @@ fn resolve(raw: Raw, repo: Option<PathBuf>) -> Result<Config> {
             file: raw.runtime.compose,
             env_file: raw.runtime.env_file,
             up_args: raw.runtime.up_args.unwrap_or_default(),
+            subnet: raw.runtime.subnet,
         },
     };
     let forward = match raw.ports.forward.as_deref() {
@@ -628,6 +641,17 @@ mod tests {
             Some("http://127.0.0.1:{local_port}")
         );
         assert!(config.schema.is_some());
+    }
+
+    #[test]
+    fn a_subnet_is_per_lease_and_compose_only() {
+        let config = Config::parse("[runtime]\nsubnet = \"172.16.{n}.0/24\"").unwrap();
+        assert!(matches!(
+            config.runtime,
+            Runtime::Compose { subnet: Some(ref s), .. } if s == "172.16.{n}.0/24"
+        ));
+        assert!(Config::parse("[runtime]\nsubnet = \"172.16.5.0/24\"").is_err());
+        assert!(Config::parse("[runtime]\nstart = \"x\"\nsubnet = \"172.16.{n}.0/24\"").is_err());
     }
 
     #[test]

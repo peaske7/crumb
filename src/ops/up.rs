@@ -274,6 +274,7 @@ fn start(
             file,
             env_file,
             up_args,
+            subnet,
         } => {
             let service = config
                 .service
@@ -294,10 +295,11 @@ fn start(
             functions.push_str(&heredoc(
                 "write_labels",
                 "CRUMB_LABELS_EOF",
-                &labels(service, lease, database, worktree),
+                &labels(service, lease, database, worktree, subnet.is_some()),
             )?);
             header.extend([
                 ("RUNTIME", "compose".to_string()),
+                ("SUBNET", subnet.clone().unwrap_or_default()),
                 ("COMPOSE_FILE", compose_file),
                 ("ENV_FILE", env_file.clone().unwrap_or_default()),
                 ("SERVICE", service.to_string()),
@@ -308,6 +310,7 @@ fn start(
         Runtime::Process { start, .. } => {
             header.extend([
                 ("RUNTIME", "process".to_string()),
+                ("SUBNET", String::new()),
                 ("COMPOSE_FILE", String::new()),
                 ("ENV_FILE", String::new()),
                 ("SERVICE", String::new()),
@@ -366,9 +369,16 @@ fn heredoc(name: &str, marker: &str, text: &str) -> Result<String> {
     ))
 }
 
-/// The compose override that labels the service with the lease. `@@PORT@@`
-/// is filled in on the host once the port is chosen.
-fn labels(service: &str, lease: &str, database: Option<&str>, worktree: &Path) -> String {
+/// The compose override that labels the service with the lease, and pins the
+/// default network's subnet when the project sets one. `@@PORT@@` and
+/// `@@SUBNET@@` are filled in on the host once the port is chosen.
+fn labels(
+    service: &str,
+    lease: &str,
+    database: Option<&str>,
+    worktree: &Path,
+    subnet: bool,
+) -> String {
     let json = |value: &str| serde_json::Value::String(value.to_string()).to_string();
     let mut text = format!(
         "services:\n  {service}:\n    labels:\n      crumb.lease: {}\n      crumb.port: \"@@PORT@@\"\n      crumb.worktree: {}\n",
@@ -377,6 +387,11 @@ fn labels(service: &str, lease: &str, database: Option<&str>, worktree: &Path) -
     );
     if let Some(database) = database {
         text.push_str(&format!("      crumb.db: {}\n", json(database)));
+    }
+    if subnet {
+        text.push_str(
+            "networks:\n  default:\n    ipam:\n      config:\n        - subnet: \"@@SUBNET@@\"\n",
+        );
     }
     text
 }
@@ -429,9 +444,24 @@ mod tests {
 
     #[test]
     fn labels_are_valid_yaml_strings() {
-        let text = labels("backend", "a", Some("wt_a"), Path::new("/w/it's \"here\""));
+        let text = labels(
+            "backend",
+            "a",
+            Some("wt_a"),
+            Path::new("/w/it's \"here\""),
+            false,
+        );
         assert!(text.contains("crumb.worktree: \"/w/it's \\\"here\\\"\""));
         assert!(text.contains("crumb.port: \"@@PORT@@\""));
+        assert!(!text.contains("networks:"));
+    }
+
+    #[test]
+    fn a_subnet_pins_the_default_network() {
+        let text = labels("backend", "a", None, Path::new("/w"), true);
+        assert!(text.ends_with(
+            "networks:\n  default:\n    ipam:\n      config:\n        - subnet: \"@@SUBNET@@\"\n"
+        ));
     }
 
     #[test]
