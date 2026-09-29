@@ -309,9 +309,8 @@ Orca environment recipes and Conductor scripts use the same shape.
 
 ## Setup
 
-- Install: `mise use -g github:peaske7/crumb`, `brew install
-  peaske7/tap/crumb`, the shell installer from the GitHub release, or `cargo
-  binstall crumb-cli` (the crates.io name `crumb` is taken). One release
+- Install: `mise use -g github:peaske7/crumb`, the shell installer from the
+  GitHub release, or `cargo binstall crumb-cli` (the crates.io name `crumb` is taken). One release
   built by `dist`, macOS and Linux, arm64 and x64.
 - `crumb --version` includes the commit it was built from, with `-dirty` for
   uncommitted changes, and `doctor` reports it, so a bug report says which

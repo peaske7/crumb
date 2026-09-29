@@ -49,15 +49,13 @@ crumb agents install   # teach Claude Code and Codex to use crumb
 ```
 
 From the first release on: `mise use -g github:peaske7/crumb`, the shell
-installer attached to each GitHub release, `brew install
-peaske7/tap/crumb` and `cargo binstall crumb-cli`. macOS and Linux, arm64 and
-x64.
+installer attached to each GitHub release, and `cargo binstall crumb-cli`.
+macOS and Linux, arm64 and x64.
 
 To update, use the same method you installed with:
 
 ```sh
 mise upgrade github:peaske7/crumb
-brew upgrade peaske7/tap/crumb
 cargo binstall crumb-cli                                   # replaces an older release
 curl -LsSf https://github.com/peaske7/crumb/releases/latest/download/crumb-cli-installer.sh | sh
 cargo install --git https://github.com/peaske7/crumb --locked   # from source
