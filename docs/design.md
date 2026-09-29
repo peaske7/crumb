@@ -173,6 +173,14 @@ port.
   when the container exits or restarts while it waits.
 - Exit codes 137 and 143 without an out-of-memory kill are `docker stop`, so
   the lease reads "stopped", not "exited".
+- `runtime.subnet` (for example `"172.16.{n}.0/24"`) pins the project's
+  default network to a subnet made from the lease's number, through the same
+  override. Docker's default pool gives each network a /16 from
+  `172.17.0.0/16`–`172.31.0.0/16`, and stopped leases keep theirs, so about
+  fifteen leases use it up. Docker then falls back to `192.168.0.0/20`, which
+  a host firewall that forwards only `172.16.0.0/12` leaves without internet.
+  The lease's number is unique, so pinned subnets never overlap. Compose
+  recreates an existing network whose subnet differs.
 - Recommended restart policy: `on-failure:5`. It caps crash loops, and leases
   stay stopped after a host reboot instead of all starting at once.
 - Dependency drift: the SHA-256 of the lockfile inside the image (computed

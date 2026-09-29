@@ -2,9 +2,10 @@
 # lock so two `up`s never take the same port. Sent on stdin (`bash -s`).
 #
 # crumb prepends: LEASE PROJECT RUNTIME STATE_ROOT PROJECT_DIR COMPOSE_FILE
-# ENV_FILE SERVICE UP_ARGS START HOST_BASE LOCAL_BASE LOCAL_USED MEMORY_MB
-# KEEP_FREE_MB and the functions write_compose and write_labels, which write
-# the compose file and the labels override (with @@PORT@@ for the port).
+# ENV_FILE SERVICE UP_ARGS SUBNET START HOST_BASE LOCAL_BASE LOCAL_USED
+# MEMORY_MB KEEP_FREE_MB and the functions write_compose and write_labels,
+# which write the compose file and the labels override (with @@PORT@@ for the
+# port and @@SUBNET@@ for the subnet).
 #
 # Prints "@@port <n>" once the port is known; progress goes to stderr.
 
@@ -106,7 +107,10 @@ if [ "$RUNTIME" = compose ]; then
     COMPOSE_FILE="$STATE/compose.yml"
     write_compose >"$COMPOSE_FILE"
   fi
-  write_labels | sed "s/@@PORT@@/$port/" >"$STATE/labels.yml"
+  # The lease's number picks its subnet, so no two leases overlap and none
+  # waits on Docker's default address pool.
+  subnet=$(printf '%s' "$SUBNET" | sed "s/{n}/$((port - HOST_BASE))/g")
+  write_labels | sed -e "s/@@PORT@@/$port/" -e "s|@@SUBNET@@|$subnet|" >"$STATE/labels.yml"
   set -- -p "$PROJECT" -f "$(expand "$COMPOSE_FILE")" -f "$STATE/labels.yml" --project-directory "$PROJECT_DIR"
   [ -z "$ENV_FILE" ] || set -- "$@" --env-file "$(expand "$ENV_FILE")"
   cd "$PROJECT_DIR"

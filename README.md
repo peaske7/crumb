@@ -99,6 +99,7 @@ service = "backend"           # the service crumb waits for
 port = 8080                   # its port inside the container
 env_file = "~/app/.env"       # --env-file, on the host
 up_args = ["--renew-anon-volumes"]
+subnet = "172.16.{n}.0/24"    # the default network, from the lease's number
 memory_mb = 700               # refuse `up` when it would leave less than
 keep_free_mb = 3072           # keep_free_mb available on the host
 
